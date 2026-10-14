@@ -1,9 +1,18 @@
-Forge Design 0.1.1 — Windows Kurulumu
+Forge Design 0.1.2 — Windows Kurulumu
 =====================================
-1. ForgeDesign-0.1.1-Setup.exe dosyasını çalıştırın.
+1. ForgeDesign-0.1.2-Setup.exe dosyasını çalıştırın.
 2. Sihirbaz: Türkçe/English dil, lisans, bileşenler (masaüstü kısayolu,
-   .ora/.psd ilişkilendirme), kurulum klasörü.
+   .ora/.psd ilişkilendirme, Rust araç zinciri), kurulum klasörü.
 3. Bitince "Forge Design'ı başlat" ile açılır. 150 yerleşik font kurulur.
+
+Rust (otomatik): Kurulum bilgisayarda Rust/cargo olup olmadığına bakar.
+Varsa hiçbir şey yapmaz; yoksa rustup ile otomatik kurar. Rust yalnızca
+"Kaynaktan güncelle" için gerekir, programı çalıştırmak için gerekmez.
+
+Güncelleme: Program açılışta GitHub'da yeni sürüm olup olmadığını sessizce
+kontrol eder. Elle kontrol: Help > Check for Updates…
+ - "Download & install": yeni Setup.exe'yi indirip kurar.
+ - Help > Update from Source (GitHub main): main dalını indirip derler.
 
 Not: Kurulum imzalı değil; SmartScreen uyarırsa "Ek bilgi" -> "Yine de çalıştır".
 Kaldırma: Ayarlar > Uygulamalar > Forge Design > Kaldır.

@@ -177,6 +177,7 @@ pub struct ForgeApp {
     pub light_theme: bool,
     last_autosave: Instant,
     pub recent: Vec<PathBuf>,
+    pub updater: crate::updater::Updater,
 }
 
 fn recovery_dir() -> PathBuf {
@@ -215,7 +216,10 @@ impl ForgeApp {
             light_theme: false,
             last_autosave: Instant::now(),
             recent: load_recent(),
+            updater: crate::updater::Updater::default(),
         };
+        // Quietly look for a newer release on GitHub at startup.
+        app.updater.check(true);
         for f in files {
             app.open_path(&f);
         }
@@ -922,6 +926,15 @@ impl eframe::App for ForgeApp {
 
         self.handle_shortcuts(ctx);
         self.autosave();
+        if self.updater.poll(ctx) {
+            // The setup wizard is running; close so it can replace the files.
+            self.quit_confirmed = !self.tabs.iter().any(|t| t.doc.is_modified());
+            if self.quit_confirmed {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            } else {
+                self.tools.status = "Installer started — save your work and close Forge Design to finish the update".into();
+            }
+        }
         if std::mem::take(&mut self.tools.add_font_request) {
             self.add_font_dialog();
         }
@@ -1006,6 +1019,7 @@ impl eframe::App for ForgeApp {
         });
 
         self.dialogs(ctx);
+        self.updater.ui(ctx);
     }
 }
 

@@ -79,6 +79,31 @@ Section "Desktop shortcut" SecDesktop
   CreateShortcut "$DESKTOP\${APP}.lnk" "$INSTDIR\${EXE}" "" "$INSTDIR\forge.ico"
 SectionEnd
 
+Section "Rust toolchain (auto, for updates from source)" SecRust
+  ; Skip when Rust is already installed (cargo in PATH or in %USERPROFILE%\.cargo).
+  nsExec::ExecToStack 'cmd /C cargo --version'
+  Pop $0
+  Pop $1
+  StrCmp $0 "0" rust_found
+  IfFileExists "$PROFILE\.cargo\bin\cargo.exe" rust_found
+  DetailPrint "Rust not found - downloading rustup..."
+  nsExec::ExecToLog 'powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -UseBasicParsing https://win.rustup.rs/x86_64 -OutFile $\"$TEMP\rustup-init.exe$\""'
+  Pop $0
+  StrCmp $0 "0" 0 rust_failed
+  DetailPrint "Installing Rust (stable, GNU host, no Visual Studio needed)..."
+  nsExec::ExecToLog '"$TEMP\rustup-init.exe" -y --profile minimal --default-toolchain stable --default-host x86_64-pc-windows-gnu'
+  Pop $0
+  StrCmp $0 "0" 0 rust_failed
+  DetailPrint "Rust installed."
+  Goto rust_done
+  rust_failed:
+    DetailPrint "Rust could not be installed automatically (no internet?). Forge Design itself works without it."
+    Goto rust_done
+  rust_found:
+    DetailPrint "Rust is already installed - skipping."
+  rust_done:
+SectionEnd
+
 Section "Open .ora / .psd files with Forge Design" SecAssoc
   WriteRegStr HKCR "ForgeDesign.Document" "" "Forge Design Document"
   WriteRegStr HKCR "ForgeDesign.Document\DefaultIcon" "" "$INSTDIR\forge.ico"
@@ -94,11 +119,14 @@ LangString DESC_Main ${LANG_TURKISH} "Forge Design uygulaması ve komut satırı
 LangString DESC_Main ${LANG_ENGLISH} "The Forge Design application and the forge-cli batch tool."
 LangString DESC_Desktop ${LANG_TURKISH} "Masaüstüne kısayol ekler."
 LangString DESC_Desktop ${LANG_ENGLISH} "Adds a desktop shortcut."
+LangString DESC_Rust ${LANG_TURKISH} "Rust bilgisayarda yoksa otomatik kurar (kaynaktan güncelleme için). Kuruluysa atlanır. Forge Design'ın çalışması için gerekmez."
+LangString DESC_Rust ${LANG_ENGLISH} "Installs Rust automatically if it is missing (needed only for updating from source). Skipped when already installed."
 LangString DESC_Assoc ${LANG_TURKISH} ".ora dosyalarını Forge Design ile açar; .psd/.png/.jpg için 'Birlikte aç' seçeneği ekler."
 LangString DESC_Assoc ${LANG_ENGLISH} "Opens .ora files with Forge Design and adds it to 'Open with' for .psd/.png/.jpg."
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecMain} $(DESC_Main)
   !insertmacro MUI_DESCRIPTION_TEXT ${SecDesktop} $(DESC_Desktop)
+  !insertmacro MUI_DESCRIPTION_TEXT ${SecRust} $(DESC_Rust)
   !insertmacro MUI_DESCRIPTION_TEXT ${SecAssoc} $(DESC_Assoc)
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 

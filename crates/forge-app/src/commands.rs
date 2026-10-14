@@ -139,6 +139,8 @@ pub enum Cmd {
     ShowPanel(crate::app::PanelId),
     AddFont,
     CloseAll,
+    CheckUpdates,
+    UpdateFromSource,
     ToggleTheme,
     // Help
     About,
@@ -385,6 +387,8 @@ fn recordable(c: Cmd) -> bool {
             | Cmd::TogglePanels
             | Cmd::ShowPanel(_)
             | Cmd::AddFont
+            | Cmd::CheckUpdates
+            | Cmd::UpdateFromSource
             | Cmd::CloseAll
             | Cmd::ToggleTheme
             | Cmd::ToggleRulers
@@ -594,6 +598,8 @@ impl ForgeApp {
                 return;
             }
             Cmd::AddFont => return self.add_font_dialog(),
+            Cmd::CheckUpdates => return self.updater.check(false),
+            Cmd::UpdateFromSource => return self.updater.update_from_source(),
             Cmd::CloseAll => {
                 for i in (0..self.tabs.len()).rev() {
                     self.request_close_tab(i);
@@ -1556,6 +1562,10 @@ impl ForgeApp {
             });
             ui.menu_button("Help", |ui| {
                 item(ui, "Keyboard Shortcuts…", "Alt+Shift+Ctrl+K", Cmd::Shortcuts, true);
+                ui.separator();
+                item(ui, "Check for Updates…", "", Cmd::CheckUpdates, true);
+                item(ui, "Update from Source (GitHub main)…", "", Cmd::UpdateFromSource, true);
+                ui.separator();
                 item(ui, "About Forge Design", "", Cmd::About, true);
             });
         });

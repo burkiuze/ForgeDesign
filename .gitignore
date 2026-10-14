@@ -1,2 +1,5 @@
 target/
 *.ora.tmp
+dist/
+packaging/windows/*.exe
+packaging/windows/fonts/

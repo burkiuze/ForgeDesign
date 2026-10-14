@@ -12,6 +12,7 @@ mod icons;
 mod panels;
 mod text;
 mod tools;
+mod updater;
 
 fn main() -> eframe::Result {
     let files: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
