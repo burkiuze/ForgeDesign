@@ -70,6 +70,96 @@ pub enum Adjustment {
     Threshold { level: u8 },
     Posterize { levels: u8 },
     GradientMap { from: Color, to: Color },
+    /// Rows are output R, G, B; columns are input R, G, B (percent) + constant.
+    ChannelMixer { matrix: [[f32; 4]; 3], monochrome: bool },
+    /// CMYK shifts (-100..100) for Reds, Yellows, Greens, Cyans, Blues,
+    /// Magentas, Whites, Neutrals, Blacks.
+    SelectiveColor { shifts: [[f32; 4]; 9], absolute: bool },
+    /// White balance: temperature (-100 cool .. 100 warm) and tint (green..magenta).
+    WhiteBalance { temperature: f32, tint: f32 },
+    /// Color Lookup with a 3D LUT (e.g. loaded from a `.cube` file).
+    ColorLookup { lut: std::sync::Arc<Lut3d> },
+}
+
+/// Selective Color ranges.
+pub const SELECTIVE_RANGES: [&str; 9] = ["Reds", "Yellows", "Greens", "Cyans", "Blues", "Magentas", "Whites", "Neutrals", "Blacks"];
+
+/// 3D colour lookup table, `size³` entries, red varying fastest.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Lut3d {
+    pub name: String,
+    pub size: usize,
+    pub data: Vec<[f32; 3]>,
+}
+
+impl Lut3d {
+    /// Parses an Adobe/Resolve `.cube` file.
+    pub fn parse_cube(name: &str, text: &str) -> Result<Lut3d, String> {
+        let mut size = 0usize;
+        let mut data = Vec::new();
+        let (mut dmin, mut dmax) = ([0.0f32; 3], [1.0f32; 3]);
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with("TITLE") {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            match parts[0] {
+                "LUT_3D_SIZE" => size = parts.get(1).and_then(|v| v.parse().ok()).ok_or("bad LUT_3D_SIZE")?,
+                "LUT_1D_SIZE" => return Err("1D LUTs are not supported".into()),
+                "DOMAIN_MIN" | "DOMAIN_MAX" => {
+                    let v: Vec<f32> = parts[1..].iter().filter_map(|p| p.parse().ok()).collect();
+                    if v.len() == 3 {
+                        if parts[0] == "DOMAIN_MIN" {
+                            dmin = [v[0], v[1], v[2]];
+                        } else {
+                            dmax = [v[0], v[1], v[2]];
+                        }
+                    }
+                }
+                _ => {
+                    let v: Vec<f32> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+                    if v.len() == 3 {
+                        data.push([v[0], v[1], v[2]]);
+                    }
+                }
+            }
+        }
+        if size < 2 || data.len() != size * size * size {
+            return Err(format!("expected {} entries, found {}", size * size * size, data.len()));
+        }
+        if dmin != [0.0; 3] || dmax != [1.0; 3] {
+            for d in &mut data {
+                for k in 0..3 {
+                    d[k] = (d[k] - dmin[k]) / (dmax[k] - dmin[k]).max(1e-6);
+                }
+            }
+        }
+        Ok(Lut3d { name: name.to_string(), size, data })
+    }
+
+    /// Trilinear lookup.
+    pub fn apply(&self, c: [f32; 3]) -> [f32; 3] {
+        let n = self.size;
+        let s = (n - 1) as f32;
+        let pos = c.map(|v| (v.clamp(0.0, 1.0) * s).min(s - 1e-4));
+        let i0 = pos.map(|v| v.floor() as usize);
+        let f = [pos[0] - i0[0] as f32, pos[1] - i0[1] as f32, pos[2] - i0[2] as f32];
+        let at = |r: usize, g: usize, b: usize| self.data[(b * n + g) * n + r];
+        let mut out = [0.0; 3];
+        for (dr, wr) in [(0, 1.0 - f[0]), (1, f[0])] {
+            for (dg, wg) in [(0, 1.0 - f[1]), (1, f[1])] {
+                for (db, wb) in [(0, 1.0 - f[2]), (1, f[2])] {
+                    let v = at((i0[0] + dr).min(n - 1), (i0[1] + dg).min(n - 1), (i0[2] + db).min(n - 1));
+                    let wgt = wr * wg * wb;
+                    for k in 0..3 {
+                        out[k] += v[k] * wgt;
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 impl Adjustment {
@@ -89,6 +179,10 @@ impl Adjustment {
             Adjustment::Threshold { .. } => "Threshold",
             Adjustment::Posterize { .. } => "Posterize",
             Adjustment::GradientMap { .. } => "Gradient Map",
+            Adjustment::ChannelMixer { .. } => "Channel Mixer",
+            Adjustment::SelectiveColor { .. } => "Selective Color",
+            Adjustment::WhiteBalance { .. } => "Color Temperature",
+            Adjustment::ColorLookup { .. } => "Color Lookup",
         }
     }
 
@@ -212,9 +306,74 @@ impl Adjustment {
                 let t = lum(c);
                 from.lerp(*to, t).rgb_array()
             }
+            Adjustment::ChannelMixer { matrix, monochrome } => {
+                let row = |r: &[f32; 4]| (c[0] * r[0] + c[1] * r[1] + c[2] * r[2]) / 100.0 + r[3] / 100.0;
+                if *monochrome {
+                    [row(&matrix[0]); 3]
+                } else {
+                    [row(&matrix[0]), row(&matrix[1]), row(&matrix[2])]
+                }
+            }
+            Adjustment::SelectiveColor { shifts, absolute } => selective_color(c, shifts, *absolute),
+            Adjustment::WhiteBalance { temperature, tint } => {
+                let t = temperature / 100.0 * 0.25;
+                let g = tint / 100.0 * 0.2;
+                let l = lum(c);
+                let o = [c[0] * (1.0 + t), c[1] * (1.0 - g), c[2] * (1.0 - t)];
+                let d = l - lum(o);
+                o.map(|v| (v + d * 0.5).clamp(0.0, 1.0))
+            }
+            Adjustment::ColorLookup { lut } => lut.apply(c),
             _ => c,
         }
     }
+}
+
+fn selective_color(c: [f32; 3], shifts: &[[f32; 4]; 9], absolute: bool) -> [f32; 3] {
+    let max = c[0].max(c[1]).max(c[2]);
+    let min = c[0].min(c[1]).min(c[2]);
+    let mid = c[0] + c[1] + c[2] - max - min;
+    // Range weights, after Photoshop: chromatic ranges use (max - mid) or
+    // (mid - min); whites/blacks/neutrals use lightness.
+    let mut weights = [0.0f32; 9];
+    let (r, g, b) = (c[0], c[1], c[2]);
+    if r == max {
+        weights[0] = max - mid;
+    }
+    if b == min {
+        weights[1] = mid - min;
+    }
+    if g == max {
+        weights[2] = max - mid;
+    }
+    if r == min {
+        weights[3] = mid - min;
+    }
+    if b == max {
+        weights[4] = max - mid;
+    }
+    if g == min {
+        weights[5] = mid - min;
+    }
+    weights[6] = ((min - 0.5) * 2.0).max(0.0);
+    weights[7] = 1.0 - ((max - 0.5).abs() + (min - 0.5).abs());
+    weights[8] = ((0.5 - max) * 2.0).max(0.0);
+    let mut cmy = [1.0 - r, 1.0 - g, 1.0 - b];
+    let orig = cmy;
+    let mut black = 0.0f32;
+    for (w, sh) in weights.iter().zip(shifts) {
+        if *w <= 0.0 {
+            continue;
+        }
+        for i in 0..3 {
+            let scale = if absolute { 1.0 } else { orig[i] };
+            cmy[i] += w * sh[i] / 100.0 * scale;
+        }
+        let kscale = if absolute { 1.0 } else { lum(c) };
+        black += w * sh[3] / 100.0 * kscale.max(0.2);
+    }
+    let rgb = cmy.map(|v| 1.0 - v.clamp(0.0, 1.0));
+    rgb.map(|v| if black >= 0.0 { v * (1.0 - black.min(1.0)) } else { v + (1.0 - v) * (-black).min(1.0) }.clamp(0.0, 1.0))
 }
 
 /// Applies an adjustment to `base` within the selection, writing into `target`.
@@ -403,6 +562,30 @@ mod tests {
                 assert!((o[i] as i32 - p[i] as i32).abs() <= 1, "{p:?} -> {o:?}");
             }
         }
+    }
+
+    #[test]
+    fn new_adjustments() {
+        let id = Adjustment::SelectiveColor { shifts: [[0.0; 4]; 9], absolute: false }.compile();
+        assert_eq!(id([200, 50, 10, 255]), [200, 50, 10, 255]);
+        let mix = Adjustment::ChannelMixer {
+            matrix: [[0.0, 100.0, 0.0, 0.0], [100.0, 0.0, 0.0, 0.0], [0.0, 0.0, 100.0, 0.0]],
+            monochrome: false,
+        }
+        .compile();
+        assert_eq!(mix([200, 50, 10, 255]), [50, 200, 10, 255]);
+        let mut cube = String::from("LUT_3D_SIZE 2\n");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    cube.push_str(&format!("{} {} {}\n", 1 - r, 1 - g, 1 - b));
+                }
+            }
+        }
+        let lut = Lut3d::parse_cube("inv", &cube).unwrap();
+        let f = Adjustment::ColorLookup { lut: std::sync::Arc::new(lut) }.compile();
+        let o = f([0, 128, 255, 255]);
+        assert!(o[0] == 255 && (o[1] as i32 - 127).abs() <= 1 && o[2] == 0, "{o:?}");
     }
 
     #[test]

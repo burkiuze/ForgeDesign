@@ -89,6 +89,28 @@ pub enum Filter {
     Twirl { angle: f32 },
     Wave { amplitude: f32, wavelength: f32 },
     Clouds { fg: Color, bg: Color, scale: f32, seed: u32 },
+    /// Spin (`zoom == false`) or zoom blur around the image centre.
+    RadialBlur { amount: f32, zoom: bool },
+    /// Bokeh-like disc blur.
+    LensBlur { radius: f32 },
+    /// Edge-preserving (bilateral) blur.
+    SurfaceBlur { radius: u32, threshold: f32 },
+    /// Sharp band at `center` (0..1 of height), blurring away from it.
+    TiltShift { center: f32, band: f32, blur: f32 },
+    SmartSharpen { amount: f32, radius: f32, noise: f32 },
+    SharpenEdges,
+    ReduceNoise { strength: f32 },
+    DustAndScratches { radius: u32, threshold: u8 },
+    OilPaint { radius: u32 },
+    Ripple { amount: f32, size: f32 },
+    /// Positive bulges outwards, negative pinches.
+    Spherize { amount: f32 },
+    PolarCoordinates { to_polar: bool },
+    LensCorrection { distortion: f32, vignette: f32, chromatic: f32 },
+    ShadowsHighlights { shadows: f32, highlights: f32, radius: f32 },
+    HdrToning { strength: f32, radius: f32, saturation: f32 },
+    Offset { dx: i32, dy: i32 },
+    Displace { amount: f32, scale: f32, seed: u32 },
 }
 
 impl Filter {
@@ -102,6 +124,18 @@ impl Filter {
             Filter::Sharpen | Filter::Emboss { .. } | Filter::FindEdges => 2,
             Filter::Wave { amplitude, .. } => amplitude.ceil() as i32 + 2,
             Filter::Pixelate { .. } | Filter::Twirl { .. } | Filter::AddNoise { .. } | Filter::Clouds { .. } => 0,
+            Filter::RadialBlur { .. } | Filter::Spherize { .. } | Filter::PolarCoordinates { .. } | Filter::Offset { .. } => 0,
+            Filter::LensCorrection { .. } => 0,
+            Filter::LensBlur { radius } => radius.ceil() as i32 + 1,
+            Filter::SurfaceBlur { radius, .. } | Filter::OilPaint { radius } | Filter::DustAndScratches { radius, .. } => {
+                *radius as i32 + 1
+            }
+            Filter::TiltShift { blur, .. } => (blur * 3.0).ceil() as i32 + 1,
+            Filter::SmartSharpen { radius, .. } => (radius * 3.0).ceil() as i32 + 1,
+            Filter::SharpenEdges | Filter::ReduceNoise { .. } => 4,
+            Filter::Ripple { amount, .. } => amount.ceil() as i32 + 2,
+            Filter::ShadowsHighlights { radius, .. } | Filter::HdrToning { radius, .. } => (radius * 3.0).ceil() as i32 + 1,
+            Filter::Displace { amount, .. } => amount.ceil() as i32 + 2,
         }
     }
 
@@ -121,6 +155,23 @@ impl Filter {
             Filter::Twirl { .. } => "Twirl",
             Filter::Wave { .. } => "Wave",
             Filter::Clouds { .. } => "Clouds",
+            Filter::RadialBlur { .. } => "Radial Blur",
+            Filter::LensBlur { .. } => "Lens Blur",
+            Filter::SurfaceBlur { .. } => "Surface Blur",
+            Filter::TiltShift { .. } => "Tilt-Shift",
+            Filter::SmartSharpen { .. } => "Smart Sharpen",
+            Filter::SharpenEdges => "Sharpen Edges",
+            Filter::ReduceNoise { .. } => "Reduce Noise",
+            Filter::DustAndScratches { .. } => "Dust & Scratches",
+            Filter::OilPaint { .. } => "Oil Paint",
+            Filter::Ripple { .. } => "Ripple",
+            Filter::Spherize { .. } => "Spherize",
+            Filter::PolarCoordinates { .. } => "Polar Coordinates",
+            Filter::LensCorrection { .. } => "Lens Correction",
+            Filter::ShadowsHighlights { .. } => "Shadows/Highlights",
+            Filter::HdrToning { .. } => "HDR Toning",
+            Filter::Offset { .. } => "Offset",
+            Filter::Displace { .. } => "Displace",
         }
     }
 
@@ -229,6 +280,260 @@ impl Filter {
                         x + amplitude * ((y + oy) * tau / wl).sin(),
                         y + amplitude * ((x + ox) * tau / wl).sin(),
                     )
+                })
+            }
+            Filter::RadialBlur { amount, zoom } => {
+                let (cx, cy) = (full.0 as f32 * 0.5 - origin.0 as f32, full.1 as f32 * 0.5 - origin.1 as f32);
+                let n = 24;
+                let mut out = img.clone();
+                out.data.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
+                    for (x, p) in row.iter_mut().enumerate() {
+                        let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                        let mut acc = [0.0; 4];
+                        for i in 0..n {
+                            let t = (i as f32 / (n - 1) as f32 - 0.5) * amount / 100.0;
+                            let (sx, sy) = if zoom {
+                                (cx + (px - cx) * (1.0 + t * 0.5), cy + (py - cy) * (1.0 + t * 0.5))
+                            } else {
+                                let (s, c) = (t * 0.5).sin_cos();
+                                (cx + (px - cx) * c - (py - cy) * s, cy + (px - cx) * s + (py - cy) * c)
+                            };
+                            let v = img.sample(sx, sy);
+                            for k in 0..4 {
+                                acc[k] += v[k];
+                            }
+                        }
+                        *p = acc.map(|v| v / n as f32);
+                    }
+                });
+                out
+            }
+            Filter::LensBlur { radius } => {
+                let n = ((radius * radius * 3.14) as usize).clamp(8, 160);
+                let golden = std::f32::consts::PI * (3.0 - 5f32.sqrt());
+                let offsets: Vec<(f32, f32)> = (0..n)
+                    .map(|i| {
+                        let r = radius * ((i as f32 + 0.5) / n as f32).sqrt();
+                        let a = i as f32 * golden;
+                        (r * a.cos(), r * a.sin())
+                    })
+                    .collect();
+                let mut out = img.clone();
+                out.data.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
+                    for (x, p) in row.iter_mut().enumerate() {
+                        let mut acc = [0.0; 4];
+                        let mut wsum = 0.0;
+                        for &(dx, dy) in &offsets {
+                            let v = img.get(x as isize + dx.round() as isize, y as isize + dy.round() as isize);
+                            // Bright spots weigh more: bokeh highlights.
+                            let w = 1.0 + crate::color::lum([v[0], v[1], v[2]]).powi(4) * 4.0;
+                            for k in 0..4 {
+                                acc[k] += v[k] * w;
+                            }
+                            wsum += w;
+                        }
+                        *p = acc.map(|v| v / wsum);
+                    }
+                });
+                out
+            }
+            Filter::SurfaceBlur { radius, threshold } => bilateral(img, radius as isize, threshold / 255.0),
+            Filter::ReduceNoise { strength } => bilateral(img, 3, (strength * 0.25).max(0.01)),
+            Filter::TiltShift { center, band, blur } => {
+                let mut blurred = img.data.clone();
+                gaussian_blur(&mut blurred, img.w, img.h, blur);
+                let fh = full.1 as f32;
+                let cy = center * fh;
+                let half = band * fh * 0.5;
+                let data = blurred
+                    .par_iter()
+                    .zip(&img.data)
+                    .enumerate()
+                    .map(|(i, (b, o))| {
+                        let gy = origin.1 as f32 + (i / img.w) as f32;
+                        let d = ((gy - cy).abs() - half).max(0.0) / (fh * 0.15).max(1.0);
+                        let t = d.clamp(0.0, 1.0);
+                        let t = t * t * (3.0 - 2.0 * t);
+                        [0, 1, 2, 3].map(|k| o[k] + (b[k] - o[k]) * t)
+                    })
+                    .collect();
+                FImage { data, ..*img }
+            }
+            Filter::SmartSharpen { amount, radius, noise } => {
+                Filter::UnsharpMask { amount, radius, threshold: (noise * 2.55) as u8 }.run(img, origin, full)
+            }
+            Filter::SharpenEdges => {
+                let edges = find_edges(img);
+                let sharp = Filter::UnsharpMask { amount: 1.2, radius: 1.0, threshold: 0 }.run(img, origin, full);
+                let data = img
+                    .data
+                    .par_iter()
+                    .zip(&sharp.data)
+                    .zip(&edges.data)
+                    .map(|((o, s), e)| {
+                        // find_edges gives white = flat; dark = edge.
+                        let edge = if e[3] > 0.0 { 1.0 - crate::color::lum([e[0] / e[3], e[1] / e[3], e[2] / e[3]]) } else { 0.0 };
+                        let t = (edge * 3.0).clamp(0.0, 1.0);
+                        [0, 1, 2, 3].map(|k| o[k] + (s[k] - o[k]) * t)
+                    })
+                    .collect();
+                FImage { data, ..*img }
+            }
+            Filter::DustAndScratches { radius, threshold } => {
+                let med = median(img, radius as usize);
+                let th = threshold as f32 / 255.0;
+                let data = img
+                    .data
+                    .par_iter()
+                    .zip(&med.data)
+                    .map(|(o, m)| {
+                        let d = (0..3).map(|k| (o[k] - m[k]).abs()).fold(0.0, f32::max);
+                        if d > th {
+                            *m
+                        } else {
+                            *o
+                        }
+                    })
+                    .collect();
+                FImage { data, ..*img }
+            }
+            Filter::OilPaint { radius } => kuwahara(img, radius.max(1) as isize),
+            Filter::Ripple { amount, size } => Filter::Wave { amplitude: amount, wavelength: size.max(2.0) }.run(img, origin, full),
+            Filter::Spherize { amount } => {
+                let (fw, fh) = (full.0 as f32, full.1 as f32);
+                let (cx, cy) = (fw * 0.5 - origin.0 as f32, fh * 0.5 - origin.1 as f32);
+                let (rx, ry) = (fw * 0.5, fh * 0.5);
+                let a = (amount / 100.0).clamp(-1.0, 1.0);
+                warp(img, |x, y| {
+                    let (nx, ny) = ((x - cx) / rx, (y - cy) / ry);
+                    let r = (nx * nx + ny * ny).sqrt();
+                    if r >= 1.0 || r == 0.0 {
+                        return (x, y);
+                    }
+                    let nr = if a >= 0.0 { r.powf(1.0 + a) } else { r.powf(1.0 / (1.0 - a)) };
+                    let k = nr / r;
+                    (cx + nx * k * rx, cy + ny * k * ry)
+                })
+            }
+            Filter::PolarCoordinates { to_polar } => {
+                let (fw, fh) = (full.0 as f32, full.1 as f32);
+                let (cx, cy) = (fw * 0.5 - origin.0 as f32, fh * 0.5 - origin.1 as f32);
+                let rmax = (fw * fw + fh * fh).sqrt() * 0.5;
+                let (ox, oy) = (origin.0 as f32, origin.1 as f32);
+                warp(img, |x, y| {
+                    if to_polar {
+                        let (dx, dy) = (x - cx, y - cy);
+                        let ang = dx.atan2(-dy).rem_euclid(std::f32::consts::TAU);
+                        let r = (dx * dx + dy * dy).sqrt() / rmax;
+                        (ang / std::f32::consts::TAU * fw - ox, r * fh - oy)
+                    } else {
+                        let ang = (x + ox) / fw * std::f32::consts::TAU;
+                        let r = (y + oy) / fh * rmax;
+                        (cx + r * ang.sin(), cy - r * ang.cos())
+                    }
+                })
+            }
+            Filter::LensCorrection { distortion, vignette, chromatic } => {
+                let (fw, fh) = (full.0 as f32, full.1 as f32);
+                let (cx, cy) = (fw * 0.5 - origin.0 as f32, fh * 0.5 - origin.1 as f32);
+                let norm = (cx * cx + cy * cy).sqrt().max(1.0);
+                let k = distortion / 100.0;
+                let ca = chromatic / 1000.0;
+                let mut out = img.clone();
+                out.data.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
+                    for (x, p) in row.iter_mut().enumerate() {
+                        let (dx, dy) = ((x as f32 + 0.5 - cx) / norm, (y as f32 + 0.5 - cy) / norm);
+                        let r2 = dx * dx + dy * dy;
+                        let f = 1.0 + k * r2;
+                        let at = |s: f32| img.sample(cx + dx * f * s * norm, cy + dy * f * s * norm);
+                        let g = at(1.0);
+                        let mut o = g;
+                        if ca != 0.0 {
+                            o[0] = at(1.0 + ca)[0];
+                            o[2] = at(1.0 - ca)[2];
+                        }
+                        let v = (1.0 + vignette / 100.0 * r2).max(0.0);
+                        *p = [o[0] * v, o[1] * v, o[2] * v, o[3]].map(|c| c.max(0.0));
+                        p[0] = p[0].min(p[3]);
+                        p[1] = p[1].min(p[3]);
+                        p[2] = p[2].min(p[3]);
+                    }
+                });
+                out
+            }
+            Filter::ShadowsHighlights { shadows, highlights, radius } => {
+                let lum_img: Vec<[f32; 1]> = img
+                    .data
+                    .iter()
+                    .map(|p| if p[3] > 0.0 { [crate::color::lum([p[0] / p[3], p[1] / p[3], p[2] / p[3]])] } else { [0.0] })
+                    .collect();
+                let mut lb = lum_img.clone();
+                gaussian_blur(&mut lb, img.w, img.h, radius);
+                let (s, h) = (shadows / 100.0, highlights / 100.0);
+                let data = img
+                    .data
+                    .par_iter()
+                    .zip(&lb)
+                    .map(|(p, [l])| {
+                        if p[3] <= 0.0 {
+                            return *p;
+                        }
+                        let a = p[3];
+                        let ws = s * (1.0 - l).powi(2) * 2.0;
+                        let wh = h * l.powi(2) * 1.5;
+                        let f = |c: f32| {
+                            let c = c / a;
+                            let c = c.powf(1.0 / (1.0 + ws));
+                            (c.powf(1.0 + wh)).clamp(0.0, 1.0) * a
+                        };
+                        [f(p[0]), f(p[1]), f(p[2]), a]
+                    })
+                    .collect();
+                FImage { data, ..*img }
+            }
+            Filter::HdrToning { strength, radius, saturation } => {
+                let mut b = img.data.clone();
+                gaussian_blur(&mut b, img.w, img.h, radius);
+                let data = img
+                    .data
+                    .par_iter()
+                    .zip(&b)
+                    .map(|(o, bl)| {
+                        let a = o[3];
+                        if a <= 0.0 {
+                            return *o;
+                        }
+                        let mut c = [0.0; 3];
+                        for k in 0..3 {
+                            let detail = o[k] - bl[k];
+                            c[k] = ((bl[k] + detail * (1.0 + strength)) / a).clamp(0.0, 1.0);
+                        }
+                        let [hh, ss, ll] = crate::color::rgb_to_hsl(c);
+                        let c = crate::color::hsl_to_rgb([hh, (ss * (1.0 + saturation / 100.0)).clamp(0.0, 1.0), ll]);
+                        [c[0] * a, c[1] * a, c[2] * a, a]
+                    })
+                    .collect();
+                FImage { data, ..*img }
+            }
+            Filter::Offset { dx, dy } => {
+                let mut out = img.clone();
+                let (w, h) = (img.w as i32, img.h as i32);
+                out.data.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
+                    for (x, p) in row.iter_mut().enumerate() {
+                        let sx = (x as i32 - dx).rem_euclid(w.max(1));
+                        let sy = (y as i32 - dy).rem_euclid(h.max(1));
+                        *p = img.data[sy as usize * img.w + sx as usize];
+                    }
+                });
+                out
+            }
+            Filter::Displace { amount, scale, seed } => {
+                let (ox, oy) = (origin.0 as f32, origin.1 as f32);
+                let sc = scale.max(1.0);
+                warp(img, |x, y| {
+                    let nx = fbm((x + ox) / sc, (y + oy) / sc, seed) - 0.5;
+                    let ny = fbm((x + ox) / sc, (y + oy) / sc, seed.wrapping_add(977)) - 0.5;
+                    (x + nx * 2.0 * amount, y + ny * 2.0 * amount)
                 })
             }
             Filter::Clouds { fg, bg, scale, seed } => {
@@ -481,6 +786,75 @@ fn find_edges(img: &FImage) -> FImage {
     out
 }
 
+/// Edge-preserving bilateral filter.
+fn bilateral(img: &FImage, radius: isize, sigma_c: f32) -> FImage {
+    let step = (radius / 6).max(1);
+    let inv2 = 1.0 / (2.0 * sigma_c * sigma_c).max(1e-6);
+    let sr2 = (radius * radius) as f32;
+    let mut out = img.clone();
+    out.data.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
+        for (x, p) in row.iter_mut().enumerate() {
+            let c = img.data[y * img.w + x];
+            let mut acc = [0.0; 4];
+            let mut wsum = 0.0;
+            let mut dy = -radius;
+            while dy <= radius {
+                let mut dx = -radius;
+                while dx <= radius {
+                    let d2 = (dx * dx + dy * dy) as f32;
+                    if d2 <= sr2 {
+                        let s = img.get(x as isize + dx, y as isize + dy);
+                        let diff = (0..3).map(|k| (s[k] - c[k]).powi(2)).sum::<f32>();
+                        let w = (-diff * inv2).exp();
+                        for k in 0..4 {
+                            acc[k] += s[k] * w;
+                        }
+                        wsum += w;
+                    }
+                    dx += step;
+                }
+                dy += step;
+            }
+            *p = acc.map(|v| v / wsum.max(1e-6));
+        }
+    });
+    out
+}
+
+/// Kuwahara filter (painterly "Oil Paint").
+fn kuwahara(img: &FImage, r: isize) -> FImage {
+    let mut out = img.clone();
+    out.data.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
+        for (x, p) in row.iter_mut().enumerate() {
+            let mut best = (f32::MAX, [0.0; 4]);
+            for (qx, qy) in [(-1isize, -1isize), (1, -1), (-1, 1), (1, 1)] {
+                let mut sum = [0.0f32; 4];
+                let mut sq = 0.0f32;
+                let mut n = 0.0f32;
+                for dy in 0..=r {
+                    for dx in 0..=r {
+                        let s = img.get(x as isize + dx * qx, y as isize + dy * qy);
+                        for k in 0..4 {
+                            sum[k] += s[k];
+                        }
+                        let l = s[0] + s[1] + s[2];
+                        sq += l * l;
+                        n += 1.0;
+                    }
+                }
+                let mean = sum.map(|v| v / n);
+                let ml = mean[0] + mean[1] + mean[2];
+                let var = sq / n - ml * ml;
+                if var < best.0 {
+                    best = (var, mean);
+                }
+            }
+            *p = best.1;
+        }
+    });
+    out
+}
+
 /// Median using a sliding 256-bin histogram per channel (Huang's algorithm).
 fn median(img: &FImage, r: usize) -> FImage {
     if r == 0 {
@@ -648,6 +1022,25 @@ mod tests {
             Filter::Twirl { angle: 90.0 },
             Filter::Wave { amplitude: 4.0, wavelength: 20.0 },
             Filter::Clouds { fg: Color::BLACK, bg: Color::WHITE, scale: 20.0, seed: 3 },
+            Filter::RadialBlur { amount: 20.0, zoom: true },
+            Filter::RadialBlur { amount: 20.0, zoom: false },
+            Filter::LensBlur { radius: 4.0 },
+            Filter::SurfaceBlur { radius: 4, threshold: 20.0 },
+            Filter::TiltShift { center: 0.5, band: 0.2, blur: 4.0 },
+            Filter::SmartSharpen { amount: 1.0, radius: 1.0, noise: 5.0 },
+            Filter::SharpenEdges,
+            Filter::ReduceNoise { strength: 0.5 },
+            Filter::DustAndScratches { radius: 2, threshold: 10 },
+            Filter::OilPaint { radius: 3 },
+            Filter::Ripple { amount: 3.0, size: 10.0 },
+            Filter::Spherize { amount: 50.0 },
+            Filter::PolarCoordinates { to_polar: true },
+            Filter::PolarCoordinates { to_polar: false },
+            Filter::LensCorrection { distortion: 10.0, vignette: -30.0, chromatic: 5.0 },
+            Filter::ShadowsHighlights { shadows: 35.0, highlights: 10.0, radius: 10.0 },
+            Filter::HdrToning { strength: 0.5, radius: 10.0, saturation: 20.0 },
+            Filter::Offset { dx: 5, dy: 3 },
+            Filter::Displace { amount: 5.0, scale: 20.0, seed: 2 },
         ];
         for f in all {
             let mut t = base.clone();

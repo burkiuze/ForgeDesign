@@ -351,20 +351,48 @@ impl Affine {
     }
 }
 
+/// Bounds of what a transform moves: the selection, or the layer content.
+pub fn transform_source_bounds(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>) -> Option<IRect> {
+    match sel {
+        Some(s) => s.content_bounds(),
+        None => base.content_bounds(),
+    }
+}
+
 /// Free Transform of the selected pixels (or whole layer).
 pub fn transform_pixels(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>, m: Affine, method: Resample) -> (TiledBuffer<Rgba8>, Option<Mask>) {
-    let (w, h) = (base.width(), base.height());
     let Some(inv) = m.inverse() else { return (base.clone(), sel.cloned()) };
-    let src_bounds = match sel {
-        Some(s) => s.content_bounds().unwrap_or_default(),
-        None => base.content_bounds().unwrap_or_default(),
-    };
-    if src_bounds.is_empty() {
-        return (base.clone(), sel.cloned());
-    }
-    // Floating content (premultiplied, selection applied).
-    let pad = 2;
-    let src_rect = src_bounds.expand(pad);
+    let Some(src_bounds) = transform_source_bounds(base, sel) else { return (base.clone(), sel.cloned()) };
+    let corners = [
+        m.apply(src_bounds.x0 as f32, src_bounds.y0 as f32),
+        m.apply(src_bounds.x1 as f32, src_bounds.y0 as f32),
+        m.apply(src_bounds.x0 as f32, src_bounds.y1 as f32),
+        m.apply(src_bounds.x1 as f32, src_bounds.y1 as f32),
+    ];
+    map_pixels(base, sel, src_bounds, &corners, method, |x, y| Some(inv.apply(x, y)))
+}
+
+/// Perspective / Distort / Skew: maps the source bounds' corners
+/// (TL, TR, BR, BL) onto `dst` corners.
+pub fn transform_pixels_quad(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>, dst: [(f32, f32); 4], method: Resample) -> (TiledBuffer<Rgba8>, Option<Mask>) {
+    let Some(b) = transform_source_bounds(base, sel) else { return (base.clone(), sel.cloned()) };
+    let src = [(b.x0 as f32, b.y0 as f32), (b.x1 as f32, b.y0 as f32), (b.x1 as f32, b.y1 as f32), (b.x0 as f32, b.y1 as f32)];
+    let Some(hinv) = Homography::from_quads(dst, src) else { return (base.clone(), sel.cloned()) };
+    map_pixels(base, sel, b, &dst, method, |x, y| hinv.apply(x, y))
+}
+
+/// Shared implementation: lifts the selected pixels, then fills the
+/// destination region by inverse-mapping each pixel with `inv`.
+fn map_pixels(
+    base: &TiledBuffer<Rgba8>,
+    sel: Option<&Mask>,
+    src_bounds: IRect,
+    dst_corners: &[(f32, f32)],
+    method: Resample,
+    inv: impl Fn(f32, f32) -> Option<(f32, f32)> + Sync,
+) -> (TiledBuffer<Rgba8>, Option<Mask>) {
+    let (w, h) = (base.width(), base.height());
+    let src_rect = src_bounds.expand(2);
     let mut img = FImage::from_buffer(base, src_rect);
     if let Some(s) = sel {
         img.data.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
@@ -373,16 +401,18 @@ pub fn transform_pixels(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>, m: Affine
                 *p = p.map(|v| v * c);
             }
         });
+    } else {
+        // Without a selection only the layer content (src_bounds) moves.
+        img.data.par_chunks_mut(img.w).enumerate().for_each(|(y, row)| {
+            for (x, p) in row.iter_mut().enumerate() {
+                if !src_bounds.contains(src_rect.x0 + x as i32, src_rect.y0 + y as i32) {
+                    *p = [0.0; 4];
+                }
+            }
+        });
     }
-    // Destination bounding box.
-    let corners = [
-        m.apply(src_bounds.x0 as f32, src_bounds.y0 as f32),
-        m.apply(src_bounds.x1 as f32, src_bounds.y0 as f32),
-        m.apply(src_bounds.x0 as f32, src_bounds.y1 as f32),
-        m.apply(src_bounds.x1 as f32, src_bounds.y1 as f32),
-    ];
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for (x, y) in corners {
+    for &(x, y) in dst_corners {
         x0 = x0.min(x);
         y0 = y0.min(y);
         x1 = x1.max(x);
@@ -390,10 +420,9 @@ pub fn transform_pixels(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>, m: Affine
     }
     let dst = IRect::new(x0.floor() as i32 - 1, y0.floor() as i32 - 1, x1.ceil() as i32 + 1, y1.ceil() as i32 + 1).clamp_to(w, h);
 
-    // Base with the selection removed (the "hole").
     let mut out = base.clone();
     out.par_for_each_in_rect_mut(src_bounds, |x, y, p| {
-        let s = coverage(sel, x, y);
+        let s = if sel.is_some() { coverage(sel, x, y) } else { 1.0 };
         p[3] = (p[3] as f32 * (1.0 - s) + 0.5) as u8;
     });
     let sample = |sx: f32, sy: f32| -> [f32; 4] {
@@ -415,7 +444,7 @@ pub fn transform_pixels(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>, m: Affine
         }
     };
     out.par_for_each_in_rect_mut(dst, |x, y, p| {
-        let (sx, sy) = inv.apply(x as f32 + 0.5, y as f32 + 0.5);
+        let Some((sx, sy)) = inv(x as f32 + 0.5, y as f32 + 0.5) else { return };
         let f = sample(sx, sy);
         if f[3] <= 0.0 {
             return;
@@ -427,13 +456,169 @@ pub fn transform_pixels(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>, m: Affine
     let new_sel = sel.map(|s| {
         let mut ns = Mask::new(w, h);
         ns.par_for_each_in_rect_mut(dst, |x, y, v| {
-            let (sx, sy) = inv.apply(x as f32 + 0.5, y as f32 + 0.5);
-            *v = s.get(sx.floor() as i32, sy.floor() as i32);
+            if let Some((sx, sy)) = inv(x as f32 + 0.5, y as f32 + 0.5) {
+                *v = s.get(sx.floor() as i32, sy.floor() as i32);
+            }
         });
         ns.optimize();
         ns
     });
     (out, new_sel)
+}
+
+/// Projective 3×3 transform.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Homography(pub [f64; 9]);
+
+impl Homography {
+    /// Solves for the homography mapping `src[i]` → `dst[i]`.
+    pub fn from_quads(src: [(f32, f32); 4], dst: [(f32, f32); 4]) -> Option<Homography> {
+        let mut a = [[0.0f64; 9]; 8];
+        for i in 0..4 {
+            let (x, y) = (src[i].0 as f64, src[i].1 as f64);
+            let (u, v) = (dst[i].0 as f64, dst[i].1 as f64);
+            a[2 * i] = [x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, u];
+            a[2 * i + 1] = [0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, v];
+        }
+        // Gaussian elimination with partial pivoting.
+        for col in 0..8 {
+            let piv = (col..8).max_by(|&r1, &r2| a[r1][col].abs().total_cmp(&a[r2][col].abs()))?;
+            if a[piv][col].abs() < 1e-12 {
+                return None;
+            }
+            a.swap(col, piv);
+            for r in 0..8 {
+                if r != col {
+                    let f = a[r][col] / a[col][col];
+                    for c in col..9 {
+                        a[r][c] -= f * a[col][c];
+                    }
+                }
+            }
+        }
+        let mut h = [0.0f64; 9];
+        for i in 0..8 {
+            h[i] = a[i][8] / a[i][i];
+        }
+        h[8] = 1.0;
+        Some(Homography(h))
+    }
+
+    pub fn apply(&self, x: f32, y: f32) -> Option<(f32, f32)> {
+        let h = &self.0;
+        let (x, y) = (x as f64, y as f64);
+        let d = h[6] * x + h[7] * y + h[8];
+        if d.abs() < 1e-12 {
+            return None;
+        }
+        Some((((h[0] * x + h[1] * y + h[2]) / d) as f32, ((h[3] * x + h[4] * y + h[5]) / d) as f32))
+    }
+}
+
+/// Edit > Transform > Warp: a 4×4 bicubic Bézier control grid (row-major,
+/// 16 points) deforms the source bounds. Rendered by rasterising a fine
+/// triangle mesh with per-triangle affine texture mapping.
+pub fn warp_pixels(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>, grid: &[(f32, f32); 16]) -> (TiledBuffer<Rgba8>, Option<Mask>) {
+    let (w, h) = (base.width(), base.height());
+    let Some(b) = transform_source_bounds(base, sel) else { return (base.clone(), sel.cloned()) };
+    let bern = |t: f32| [(1.0 - t).powi(3), 3.0 * t * (1.0 - t).powi(2), 3.0 * t * t * (1.0 - t), t.powi(3)];
+    let eval = |u: f32, v: f32| {
+        let (bu, bv) = (bern(u), bern(v));
+        let mut p = (0.0, 0.0);
+        for j in 0..4 {
+            for i in 0..4 {
+                let wgt = bu[i] * bv[j];
+                p.0 += grid[j * 4 + i].0 * wgt;
+                p.1 += grid[j * 4 + i].1 * wgt;
+            }
+        }
+        p
+    };
+    const N: usize = 32;
+    let mut verts = vec![(0.0f32, 0.0f32); (N + 1) * (N + 1)];
+    for j in 0..=N {
+        for i in 0..=N {
+            verts[j * (N + 1) + i] = eval(i as f32 / N as f32, j as f32 / N as f32);
+        }
+    }
+    let src_at = |i: usize, j: usize| {
+        (b.x0 as f32 + b.width() as f32 * i as f32 / N as f32, b.y0 as f32 + b.height() as f32 * j as f32 / N as f32)
+    };
+    // Inverse map: find the triangle containing the destination pixel.
+    // Build a coarse bucket grid of triangles for fast lookup.
+    let mut tris: Vec<[(f32, f32); 6]> = Vec::with_capacity(N * N * 2);
+    for j in 0..N {
+        for i in 0..N {
+            let d00 = verts[j * (N + 1) + i];
+            let d10 = verts[j * (N + 1) + i + 1];
+            let d01 = verts[(j + 1) * (N + 1) + i];
+            let d11 = verts[(j + 1) * (N + 1) + i + 1];
+            let (s00, s10, s01, s11) = (src_at(i, j), src_at(i + 1, j), src_at(i, j + 1), src_at(i + 1, j + 1));
+            tris.push([d00, d10, d11, s00, s10, s11]);
+            tris.push([d00, d11, d01, s00, s11, s01]);
+        }
+    }
+    let corners: Vec<(f32, f32)> = verts.clone();
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for &(x, y) in &corners {
+        x0 = x0.min(x);
+        y0 = y0.min(y);
+        x1 = x1.max(x);
+        y1 = y1.max(y);
+    }
+    const G: usize = 64;
+    let cell = ((x1 - x0).max(1.0) / G as f32, (y1 - y0).max(1.0) / G as f32);
+    let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); G * G];
+    for (ti, t) in tris.iter().enumerate() {
+        let (mut a0, mut b0, mut a1, mut b1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+        for p in &t[..3] {
+            a0 = a0.min(p.0);
+            b0 = b0.min(p.1);
+            a1 = a1.max(p.0);
+            b1 = b1.max(p.1);
+        }
+        let gx0 = (((a0 - x0) / cell.0) as usize).min(G - 1);
+        let gx1 = (((a1 - x0) / cell.0) as usize).min(G - 1);
+        let gy0 = (((b0 - y0) / cell.1) as usize).min(G - 1);
+        let gy1 = (((b1 - y0) / cell.1) as usize).min(G - 1);
+        for gy in gy0..=gy1 {
+            for gx in gx0..=gx1 {
+                buckets[gy * G + gx].push(ti as u32);
+            }
+        }
+    }
+    let inv = |x: f32, y: f32| -> Option<(f32, f32)> {
+        if x < x0 || y < y0 || x > x1 || y > y1 {
+            return None;
+        }
+        let gx = (((x - x0) / cell.0) as usize).min(G - 1);
+        let gy = (((y - y0) / cell.1) as usize).min(G - 1);
+        for &ti in &buckets[gy * G + gx] {
+            let t = &tris[ti as usize];
+            let (a, bb, c) = (t[0], t[1], t[2]);
+            let det = (bb.1 - c.1) * (a.0 - c.0) + (c.0 - bb.0) * (a.1 - c.1);
+            if det.abs() < 1e-9 {
+                continue;
+            }
+            let l1 = ((bb.1 - c.1) * (x - c.0) + (c.0 - bb.0) * (y - c.1)) / det;
+            let l2 = ((c.1 - a.1) * (x - c.0) + (a.0 - c.0) * (y - c.1)) / det;
+            let l3 = 1.0 - l1 - l2;
+            if l1 >= -1e-4 && l2 >= -1e-4 && l3 >= -1e-4 {
+                return Some((l1 * t[3].0 + l2 * t[4].0 + l3 * t[5].0, l1 * t[3].1 + l2 * t[4].1 + l3 * t[5].1));
+            }
+        }
+        None
+    };
+    let _ = (w, h);
+    map_pixels(base, sel, b, &corners, Resample::Bilinear, inv)
+}
+
+/// The identity warp grid for `bounds` (4×4 points evenly spaced).
+pub fn warp_identity_grid(b: IRect) -> [(f32, f32); 16] {
+    std::array::from_fn(|k| {
+        let (i, j) = (k % 4, k / 4);
+        (b.x0 as f32 + b.width() as f32 * i as f32 / 3.0, b.y0 as f32 + b.height() as f32 * j as f32 / 3.0)
+    })
 }
 
 #[cfg(test)]
@@ -491,6 +676,27 @@ mod tests {
         assert_eq!(out.get(15, 10), [255, 0, 0, 255]);
         assert_eq!(out.get(30, 30), [0, 255, 0, 255]);
         assert_eq!(ns.unwrap().content_bounds(), Some(IRect::new(10, 5, 20, 15)));
+    }
+
+    #[test]
+    fn homography_and_warp() {
+        let src = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)];
+        let dst = [(2.0, 1.0), (20.0, 3.0), (18.0, 15.0), (1.0, 12.0)];
+        let hm = Homography::from_quads(src, dst).unwrap();
+        for i in 0..4 {
+            let (x, y) = hm.apply(src[i].0, src[i].1).unwrap();
+            assert!((x - dst[i].0).abs() < 1e-3 && (y - dst[i].1).abs() < 1e-3);
+        }
+        let mut b = TiledBuffer::new(60, 60);
+        b.par_for_each_in_rect_mut(IRect::new(10, 10, 30, 30), |_, _, p| *p = [255, 0, 0, 255]);
+        // Identity warp keeps pixels in place.
+        let grid = warp_identity_grid(IRect::new(10, 10, 30, 30));
+        let (out, _) = warp_pixels(&b, None, &grid);
+        assert_eq!(out.get(20, 20), [255, 0, 0, 255]);
+        assert_eq!(out.get(40, 40)[3], 0);
+        // Perspective onto a bigger quad.
+        let (out, _) = transform_pixels_quad(&b, None, [(5.0, 5.0), (50.0, 5.0), (50.0, 50.0), (5.0, 50.0)], Resample::Bilinear);
+        assert_eq!(out.get(45, 45), [255, 0, 0, 255]);
     }
 
     #[test]

@@ -56,6 +56,52 @@ impl DocState {
         IRect::from_size(self.width, self.height)
     }
 
+    /// Indices of all layers inside group `id` (recursively).
+    pub fn descendants(&self, id: LayerId) -> Vec<usize> {
+        let mut out = Vec::new();
+        let mut stack = vec![id];
+        while let Some(g) = stack.pop() {
+            for (i, l) in self.layers.iter().enumerate() {
+                if l.parent == Some(g) {
+                    out.push(i);
+                    if l.is_group() {
+                        stack.push(l.id);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        out
+    }
+
+    /// Nesting depth of layer `i` (0 = top level).
+    pub fn depth(&self, i: usize) -> usize {
+        let mut d = 0;
+        let mut p = self.layers[i].parent;
+        while let Some(pid) = p {
+            d += 1;
+            p = self.layers.iter().find(|l| l.id == pid).and_then(|l| l.parent);
+            if d > 64 {
+                break;
+            }
+        }
+        d
+    }
+
+    /// Whether layer `i` is effectively visible (it and all its parents).
+    pub fn effectively_visible(&self, i: usize) -> bool {
+        let mut l = &self.layers[i];
+        loop {
+            if !l.visible {
+                return false;
+            }
+            match l.parent.and_then(|p| self.layers.iter().find(|o| o.id == p)) {
+                Some(parent) => l = parent,
+                None => return true,
+            }
+        }
+    }
+
     /// Picks a unique "Layer N" name.
     pub fn next_layer_name(&self) -> String {
         let mut n = self.layers.len() + 1;
@@ -242,17 +288,142 @@ impl Document {
 
     pub fn duplicate_layer(&mut self) {
         let Some(src) = self.state.active_layer().cloned() else { return };
+        if src.is_group() {
+            // Copy the whole subtree, remapping ids, and insert it above the group.
+            let mut idmap = std::collections::HashMap::new();
+            let new_gid = self.state.alloc_id();
+            idmap.insert(src.id, new_gid);
+            let members = self.state.descendants(src.id);
+            let mut copies = Vec::new();
+            for &i in &members {
+                let id = self.state.alloc_id();
+                idmap.insert(self.state.layers[i].id, id);
+            }
+            for &i in &members {
+                let mut c = self.state.layers[i].clone();
+                c.id = idmap[&c.id];
+                c.parent = c.parent.map(|p| *idmap.get(&p).unwrap_or(&p));
+                copies.push(c);
+            }
+            let mut g = src;
+            g.id = new_gid;
+            g.name = format!("{} copy", g.name);
+            let at = self.state.active + 1;
+            copies.push(g);
+            let n = copies.len();
+            for (k, c) in copies.into_iter().enumerate() {
+                self.state.layers.insert(at + k, c);
+            }
+            self.state.active = at + n - 1;
+            self.mark_all_dirty();
+            self.commit("Duplicate Group");
+            return;
+        }
         let mut l = src;
         l.id = self.state.alloc_id();
         l.name = format!("{} copy", l.name);
         self.add_layer(l, "Duplicate Layer");
     }
 
-    pub fn delete_layer(&mut self) {
-        if self.state.layers.len() <= 1 {
+    /// Layer > Group Layers (Ctrl+G): wraps the active layer in a new group.
+    pub fn group_layer(&mut self) {
+        let Some(active) = self.state.active_layer() else { return };
+        let parent = active.parent;
+        let n = self.state.layers.iter().filter(|l| l.is_group()).count() + 1;
+        let id = self.state.alloc_id();
+        let mut g = Layer::new_group(id, format!("Group {n}"), self.width(), self.height());
+        g.parent = parent;
+        let i = self.state.active;
+        self.state.layers[i].parent = Some(id);
+        self.state.layers.insert(i + 1, g);
+        self.state.active = i + 1;
+        self.mark_all_dirty();
+        self.commit("Group Layers");
+    }
+
+    /// Layer > New > Group.
+    pub fn new_group(&mut self) {
+        let n = self.state.layers.iter().filter(|l| l.is_group()).count() + 1;
+        let id = self.state.alloc_id();
+        let mut g = Layer::new_group(id, format!("Group {n}"), self.width(), self.height());
+        g.parent = self.state.active_layer().and_then(|l| l.parent);
+        self.add_layer(g, "New Group");
+    }
+
+    /// Layer > Ungroup Layers (Shift+Ctrl+G).
+    pub fn ungroup(&mut self) {
+        let Some(g) = self.state.active_layer().filter(|l| l.is_group()).cloned() else { return };
+        for l in &mut self.state.layers {
+            if l.parent == Some(g.id) {
+                l.parent = g.parent;
+            }
+        }
+        let i = self.state.active;
+        self.state.layers.remove(i);
+        self.state.active = i.saturating_sub(1).min(self.state.layers.len() - 1);
+        self.mark_all_dirty();
+        self.commit("Ungroup Layers");
+    }
+
+    /// Moves layer `index` into group `parent` (or to the top level).
+    pub fn set_parent(&mut self, index: usize, parent: Option<LayerId>) {
+        if index >= self.state.layers.len() {
             return;
         }
-        self.state.layers.remove(self.state.active);
+        let id = self.state.layers[index].id;
+        // Refuse cycles (moving a group into its own descendant).
+        if let Some(p) = parent {
+            if p == id || self.state.descendants(id).iter().any(|&d| self.state.layers[d].id == p) {
+                return;
+            }
+        }
+        self.state.layers[index].parent = parent;
+        self.mark_all_dirty();
+        self.commit("Move Into Group");
+    }
+
+    /// Flattens a group into a single pixel layer (Merge Group).
+    pub fn merge_group(&mut self) {
+        let Some(g) = self.state.active_layer().filter(|l| l.is_group()).cloned() else { return };
+        let (w, h) = (self.width(), self.height());
+        let members = self.state.descendants(g.id);
+        let mut stack: Vec<Layer> = members.iter().map(|&i| self.state.layers[i].clone()).collect();
+        let mut gg = g.clone();
+        gg.opacity = 1.0;
+        gg.blend = crate::blend::BlendMode::Normal;
+        gg.parent = None;
+        stack.push(gg);
+        let refs: Vec<&Layer> = stack.iter().collect();
+        let pixels = composite::flatten_layers(&refs, w, h);
+        let mut merged = Layer::with_pixels(g.id, g.name.clone(), pixels);
+        merged.parent = g.parent;
+        merged.opacity = g.opacity;
+        merged.blend = g.blend;
+        merged.visible = g.visible;
+        let gi = self.state.active;
+        self.state.layers[gi] = merged;
+        for i in members.into_iter().rev() {
+            self.state.layers.remove(i);
+        }
+        self.state.active = self.state.layer_index(g.id).unwrap_or(0);
+        self.mark_all_dirty();
+        self.commit("Merge Group");
+    }
+
+    pub fn delete_layer(&mut self) {
+        let mut doomed = vec![self.state.active];
+        if let Some(l) = self.state.active_layer() {
+            if l.is_group() {
+                doomed.extend(self.state.descendants(l.id));
+            }
+        }
+        if self.state.layers.len() <= doomed.len() {
+            return;
+        }
+        doomed.sort_unstable();
+        for i in doomed.into_iter().rev() {
+            self.state.layers.remove(i);
+        }
         self.state.active = self.state.active.min(self.state.layers.len() - 1);
         self.state.editing_mask = false;
         self.mark_all_dirty();
@@ -296,7 +467,13 @@ impl Document {
     /// Merges the active layer into the one below it.
     pub fn merge_down(&mut self) {
         let i = self.state.active;
-        if i == 0 || i >= self.state.layers.len() {
+        if i < self.state.layers.len() && self.state.layers[i].is_group() {
+            return self.merge_group();
+        }
+        if i == 0 || i >= self.state.layers.len() || self.state.layers[i - 1].is_group() {
+            return;
+        }
+        if self.state.layers[i - 1].parent != self.state.layers[i].parent {
             return;
         }
         let (w, h) = (self.width(), self.height());
@@ -308,7 +485,10 @@ impl Document {
         let mut base = below.clone();
         base.opacity = 1.0;
         base.blend = crate::blend::BlendMode::Normal;
-        let merged = composite::flatten_layers(&[&base, above], w, h);
+        base.parent = None;
+        let mut above = above.clone();
+        above.parent = None;
+        let merged = composite::flatten_layers(&[&base, &above], w, h);
         let below = &mut self.state.layers[i - 1];
         below.pixels = merged;
         below.mask = None;
@@ -404,6 +584,29 @@ mod tests {
         assert!(d.undo() && d.undo());
         assert_eq!(d.state.layers.len(), 1);
         assert!(!d.is_modified());
+    }
+
+    #[test]
+    fn groups() {
+        let mut d = Document::new("t", 10, 10, Some(Color::WHITE));
+        d.new_layer();
+        d.state.layers[1].pixels.set(0, 0, [0, 0, 0, 255]);
+        d.group_layer();
+        assert_eq!(d.state.layers.len(), 3);
+        assert!(d.state.layers[2].is_group());
+        assert_eq!(d.state.layers[1].parent, Some(d.state.layers[2].id));
+        d.duplicate_layer();
+        assert_eq!(d.state.layers.len(), 5);
+        d.delete_layer();
+        assert_eq!(d.state.layers.len(), 3);
+        d.state.active = 2;
+        d.merge_group();
+        assert_eq!(d.state.layers.len(), 2);
+        assert!(!d.state.layers[1].is_group());
+        assert_eq!(d.state.layers[1].pixels.get(0, 0), [0, 0, 0, 255]);
+        d.group_layer();
+        d.ungroup();
+        assert!(d.state.layers.iter().all(|l| l.parent.is_none() && !l.is_group()));
     }
 
     #[test]

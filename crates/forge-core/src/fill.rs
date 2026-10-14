@@ -72,6 +72,21 @@ pub fn flood_mask(src: &TiledBuffer<Rgba8>, seed_x: i32, seed_y: i32, tolerance:
     out
 }
 
+/// Contiguous flood fill limited to `window` (Quick Selection brush).
+pub fn flood_mask_window(src: &TiledBuffer<Rgba8>, seed_x: i32, seed_y: i32, tolerance: u8, window: IRect) -> Mask {
+    let (w, h) = (src.width(), src.height());
+    let win = window.clamp_to(w, h);
+    let mut out = Mask::new(w, h);
+    if !win.contains(seed_x, seed_y) {
+        return out;
+    }
+    let sub = TiledBuffer::from_dense(win.width() as u32, win.height() as u32, &src.region_to_dense(win));
+    let m = flood_mask(&sub, seed_x - win.x0, seed_y - win.y0, tolerance, true);
+    out.write_dense(win, &m.to_dense());
+    out.optimize();
+    out
+}
+
 /// Composites a straight colour onto one straight pixel with a blend mode.
 #[inline]
 pub fn blend_pixel(dst: Rgba8, c: [f32; 3], a: f32, mode: BlendMode, lock_alpha: bool, x: i32, y: i32) -> Rgba8 {

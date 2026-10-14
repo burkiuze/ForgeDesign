@@ -8,4 +8,4 @@ repository.workspace = true
 
 [dependencies]
 rayon = "1.12"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }

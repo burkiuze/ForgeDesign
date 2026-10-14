@@ -13,6 +13,7 @@
 //!   PNM, … via the `image` crate (import and flattened export).
 
 mod ora;
+mod psd_export;
 mod psd_import;
 
 use std::path::Path;
@@ -24,6 +25,7 @@ use forge_core::layer::Layer;
 use forge_core::{IRect, Rgba8};
 
 pub use ora::{read_ora, write_ora};
+pub use psd_export::write_psd;
 
 #[derive(Debug, thiserror::Error)]
 pub enum IoError {
@@ -48,7 +50,7 @@ pub const OPEN_EXTENSIONS: &[&str] = &[
 ];
 
 /// Extensions accepted by [`export`].
-pub const EXPORT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "gif", "ico", "qoi"];
+pub const EXPORT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "gif", "ico", "qoi", "pdf", "psd"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExportOptions {
@@ -76,8 +78,8 @@ fn file_stem(path: &Path) -> String {
 pub fn open(path: &Path) -> Result<Document> {
     let bytes = std::fs::read(path)?;
     let mut doc = open_bytes(&bytes, &extension(path), &file_stem(path))?;
-    // Only native files keep their path; others must be "Saved As" .ora.
-    if extension(path) == "ora" {
+    // Layered formats keep their path; flat images must be "Saved As".
+    if matches!(extension(path).as_str(), "ora" | "psd") {
         doc.path = Some(path.to_path_buf());
     }
     Ok(doc)
@@ -115,11 +117,15 @@ pub fn load_image(path: &Path) -> Result<TiledBuffer<Rgba8>> {
     decode_image(&std::fs::read(path)?)
 }
 
-/// Saves the document in the native format (OpenRaster).
+/// Saves the document with layers: `.psd` writes Photoshop format,
+/// anything else OpenRaster (the native format).
 pub fn save(state: &DocState, path: &Path) -> Result<()> {
-    let bytes = write_ora(state)?;
+    let bytes = match extension(path).as_str() {
+        "psd" => write_psd(state)?,
+        _ => write_ora(state)?,
+    };
     // Write atomically so a crash never leaves a truncated file behind.
-    let tmp = path.with_extension("ora.tmp");
+    let tmp = path.with_extension("forge-tmp");
     std::fs::write(&tmp, bytes)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -127,9 +133,99 @@ pub fn save(state: &DocState, path: &Path) -> Result<()> {
 
 /// Exports the flattened image; the format is picked from the extension.
 pub fn export(state: &DocState, path: &Path, opts: ExportOptions) -> Result<()> {
-    let bytes = export_bytes(state, &extension(path), opts)?;
+    let bytes = match extension(path).as_str() {
+        "pdf" => export_pdf(state, 300.0, opts)?,
+        "psd" => write_psd(state)?,
+        "ora" => write_ora(state)?,
+        ext => export_bytes(state, ext, opts)?,
+    };
     std::fs::write(path, bytes)?;
     Ok(())
+}
+
+/// Exports a single-page PDF with the flattened image embedded as JPEG.
+/// `dpi` sets the physical page size.
+pub fn export_pdf(state: &DocState, dpi: f32, opts: ExportOptions) -> Result<Vec<u8>> {
+    let (w, h) = (state.width, state.height);
+    let jpeg = export_bytes(state, "jpg", opts)?;
+    let (pw, ph) = (w as f32 * 72.0 / dpi.max(1.0), h as f32 * 72.0 / dpi.max(1.0));
+    let content = format!("q {pw:.2} 0 0 {ph:.2} 0 0 cm /Im0 Do Q");
+    let mut out: Vec<u8> = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
+    let mut offsets = Vec::new();
+    let mut obj = |out: &mut Vec<u8>, body: Vec<u8>| {
+        offsets.push(out.len());
+        let n = offsets.len();
+        out.extend_from_slice(format!("{n} 0 obj\n").as_bytes());
+        out.extend_from_slice(&body);
+        out.extend_from_slice(b"\nendobj\n");
+    };
+    obj(&mut out, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
+    obj(&mut out, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec());
+    obj(
+        &mut out,
+        format!("<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {pw:.2} {ph:.2}] /Resources << /XObject << /Im0 4 0 R >> >> /Contents 5 0 R >>")
+            .into_bytes(),
+    );
+    let mut img = format!("<< /Type /XObject /Subtype /Image /Width {w} /Height {h} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length {} >>\nstream\n", jpeg.len()).into_bytes();
+    img.extend_from_slice(&jpeg);
+    img.extend_from_slice(b"\nendstream");
+    obj(&mut out, img);
+    let mut c = format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+    c.extend_from_slice(content.as_bytes());
+    c.extend_from_slice(b"\nendstream");
+    obj(&mut out, c);
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n0000000000 65535 f \n", offsets.len() + 1).as_bytes());
+    for o in &offsets {
+        out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", offsets.len() + 1).as_bytes());
+    Ok(out)
+}
+
+/// Frame animation: each visible pixel layer (bottom first) becomes one
+/// GIF frame. When `with_background` is set, the bottom layer is used as a
+/// backdrop for every frame instead of being a frame itself.
+pub fn export_gif_animation(state: &DocState, delay_ms: u32, with_background: bool) -> Result<Vec<u8>> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    use image::{Delay, Frame, RgbaImage};
+    let (w, h) = (state.width, state.height);
+    let frames: Vec<&Layer> = state.layers.iter().filter(|l| !l.is_group() && l.visible).collect();
+    let (bg, frames) = if with_background && frames.len() > 1 { (Some(frames[0]), &frames[1..]) } else { (None, &frames[..]) };
+    let mut out = Vec::new();
+    {
+        let mut enc = GifEncoder::new_with_speed(&mut out, 10);
+        enc.set_repeat(Repeat::Infinite)?;
+        for l in frames {
+            let mut stack: Vec<&Layer> = Vec::new();
+            if let Some(b) = bg {
+                stack.push(b);
+            }
+            stack.push(l);
+            let px = composite::composite_layers(&stack, w, h, IRect::from_size(w, h), Background::Transparent);
+            let flat: Vec<u8> = px.iter().flatten().copied().collect();
+            let img = RgbaImage::from_raw(w, h, flat).ok_or_else(|| IoError::Format("size mismatch".into()))?;
+            enc.encode_frame(Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(delay_ms, 1)))?;
+        }
+    }
+    Ok(out)
+}
+
+/// File > Export > Layers to Files: one PNG per pixel layer.
+pub fn export_layers(state: &DocState, dir: &Path, prefix: &str) -> Result<usize> {
+    let (w, h) = (state.width, state.height);
+    let mut n = 0;
+    for (i, l) in state.layers.iter().enumerate().filter(|(_, l)| !l.is_group()) {
+        let mut single = l.clone();
+        single.parent = None;
+        single.visible = true;
+        let px = composite::composite_layers(&[&single], w, h, IRect::from_size(w, h), Background::Transparent);
+        let safe: String = l.name.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+        let path = dir.join(format!("{prefix}_{i:03}_{safe}.png"));
+        std::fs::write(path, encode_rgba(&px, w, h, "png", ExportOptions::default())?)?;
+        n += 1;
+    }
+    Ok(n)
 }
 
 pub fn export_bytes(state: &DocState, ext: &str, opts: ExportOptions) -> Result<Vec<u8>> {
@@ -204,6 +300,55 @@ mod tests {
         assert_eq!(l.mask.as_ref().unwrap().get(6, 5), 255);
         assert_eq!(s.layers[0].pixels.get(0, 0), [255, 255, 255, 255]);
         assert_eq!(s.selection.unwrap().content_bounds(), Some(IRect::new(1, 2, 3, 4)));
+    }
+
+    #[test]
+    fn psd_roundtrip_with_groups() {
+        let mut d = Document::new("t", 70, 40, Some(Color::WHITE));
+        d.new_layer();
+        d.state.layers[1].pixels.set(65, 35, [10, 20, 30, 255]);
+        d.state.layers[1].blend = BlendMode::Multiply;
+        d.state.layers[1].name = "Kırmızı".into();
+        d.group_layer();
+        let bytes = write_psd(&d.state).unwrap();
+        let s = psd_import::read_psd(&bytes).unwrap();
+        assert_eq!((s.width, s.height), (70, 40));
+        assert_eq!(s.layers.len(), 3, "{:?}", s.layers.iter().map(|l| &l.name).collect::<Vec<_>>());
+        let px = s.layers.iter().find(|l| l.blend == BlendMode::Multiply).expect("multiply layer");
+        assert_eq!(px.pixels.get(65, 35), [10, 20, 30, 255]);
+        assert!(px.parent.is_some(), "layer kept its group");
+        assert!(s.layers.iter().any(|l| l.is_group()));
+    }
+
+    #[test]
+    fn ora_groups_and_styles() {
+        let mut d = Document::new("t", 30, 30, None);
+        d.new_layer();
+        d.state.layers[1].clipped = true;
+        d.state.layers[1].fill = 0.25;
+        d.state.layers[1].style = Some(forge_core::styles::LayerStyle {
+            enabled: true,
+            drop_shadow: Some(forge_core::styles::Shadow::drop()),
+            ..Default::default()
+        });
+        d.group_layer();
+        let s = read_ora(&write_ora(&d.state).unwrap()).unwrap();
+        assert_eq!(s.layers.len(), 3);
+        assert!(s.layers[2].is_group());
+        assert_eq!(s.layers[1].parent, Some(s.layers[2].id));
+        assert!(s.layers[1].clipped);
+        assert!((s.layers[1].fill - 0.25).abs() < 1e-3);
+        assert_eq!(s.layers[1].style, d.state.layers[1].style);
+    }
+
+    #[test]
+    fn pdf_gif_export() {
+        let mut d = Document::new("t", 16, 8, Some(Color::WHITE));
+        d.new_layer();
+        let pdf = export_pdf(&d.state, 72.0, ExportOptions::default()).unwrap();
+        assert!(pdf.starts_with(b"%PDF") && pdf.ends_with(b"%%EOF\n"));
+        let gif = export_gif_animation(&d.state, 100, false).unwrap();
+        assert!(gif.starts_with(b"GIF89a"));
     }
 
     #[test]

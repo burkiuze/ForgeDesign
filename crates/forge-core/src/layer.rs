@@ -3,11 +3,32 @@
 use crate::blend::BlendMode;
 use crate::buffer::TiledBuffer;
 use crate::color::Rgba8;
+use crate::styles::LayerStyle;
 
 pub type LayerId = u64;
 
 /// A layer mask: 255 reveals, 0 hides. Unallocated tiles reveal everything.
 pub type LayerMask = TiledBuffer<u8>;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LayerKind {
+    #[default]
+    Pixel,
+    /// A folder; its children have `parent == Some(group.id)`.
+    Group,
+}
+
+/// Photoshop's layer colour labels.
+pub const LABEL_COLORS: [(&str, [u8; 3]); 8] = [
+    ("None", [0, 0, 0]),
+    ("Red", [230, 80, 80]),
+    ("Orange", [240, 150, 60]),
+    ("Yellow", [235, 210, 70]),
+    ("Green", [110, 200, 100]),
+    ("Blue", [90, 150, 235]),
+    ("Violet", [170, 120, 230]),
+    ("Gray", [150, 150, 150]),
+];
 
 #[derive(Clone, Debug)]
 pub struct Layer {
@@ -24,6 +45,18 @@ pub struct Layer {
     pub pixels: TiledBuffer<Rgba8>,
     pub mask: Option<LayerMask>,
     pub mask_enabled: bool,
+    /// Fill opacity: like opacity but does not affect layer styles.
+    pub fill: f32,
+    /// Clipping mask: only visible where the layer below is opaque.
+    pub clipped: bool,
+    pub style: Option<LayerStyle>,
+    pub kind: LayerKind,
+    /// Containing group, if any.
+    pub parent: Option<LayerId>,
+    /// Group is collapsed in the Layers panel.
+    pub collapsed: bool,
+    /// Index into [`LABEL_COLORS`].
+    pub label: u8,
 }
 
 impl Layer {
@@ -39,7 +72,24 @@ impl Layer {
             pixels: TiledBuffer::new(width, height),
             mask: None,
             mask_enabled: true,
+            fill: 1.0,
+            clipped: false,
+            style: None,
+            kind: LayerKind::Pixel,
+            parent: None,
+            collapsed: false,
+            label: 0,
         }
+    }
+
+    pub fn new_group(id: LayerId, name: impl Into<String>, width: u32, height: u32) -> Self {
+        let mut l = Self::new(id, name, width, height);
+        l.kind = LayerKind::Group;
+        l
+    }
+
+    pub fn is_group(&self) -> bool {
+        self.kind == LayerKind::Group
     }
 
     pub fn with_pixels(id: LayerId, name: impl Into<String>, pixels: TiledBuffer<Rgba8>) -> Self {
@@ -89,5 +139,10 @@ impl Layer {
             && self.blend == o.blend
             && self.mask.is_some() == o.mask.is_some()
             && self.mask_enabled == o.mask_enabled
+            && self.fill == o.fill
+            && self.clipped == o.clipped
+            && self.style == o.style
+            && self.kind == o.kind
+            && self.parent == o.parent
     }
 }

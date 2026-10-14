@@ -152,6 +152,98 @@ pub fn polygon_mask(w: u32, h: u32, pts: &[Point]) -> Mask {
     m
 }
 
+/// Select > Color Range: soft selection of pixels near `color`.
+/// `fuzziness` is 0..200 like Photoshop.
+pub fn color_range(src: &TiledBuffer<crate::color::Rgba8>, color: crate::color::Rgba8, fuzziness: f32) -> Mask {
+    let fz = fuzziness.max(1.0);
+    let c = [color[0] as f32, color[1] as f32, color[2] as f32];
+    let mut m = Mask::new(src.width(), src.height());
+    m.par_map_all(|x, y, _| {
+        let p = src.get(x, y);
+        if p[3] == 0 {
+            return 0;
+        }
+        let d = ((p[0] as f32 - c[0]).powi(2) + (p[1] as f32 - c[1]).powi(2) + (p[2] as f32 - c[2]).powi(2)).sqrt();
+        let t = (1.0 - d / fz).clamp(0.0, 1.0);
+        (t * 255.0 * p[3] as f32 / 255.0 + 0.5) as u8
+    });
+    m.optimize();
+    m
+}
+
+/// Select > Focus Area: selects in-focus (high local detail) regions.
+/// `sensitivity` 0..1, higher selects more.
+pub fn focus_area(src: &TiledBuffer<crate::color::Rgba8>, sensitivity: f32) -> Mask {
+    let (w, h) = (src.width() as usize, src.height() as usize);
+    let lumv: Vec<f32> = src
+        .to_dense()
+        .iter()
+        .map(|p| crate::color::lum([p[0] as f32, p[1] as f32, p[2] as f32]) / 255.0)
+        .collect();
+    let mut energy = vec![0.0f32; w * h];
+    {
+        use rayon::prelude::*;
+        energy.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
+            for (x, e) in row.iter_mut().enumerate() {
+                let at = |xx: isize, yy: isize| lumv[(yy.clamp(0, h as isize - 1) as usize) * w + xx.clamp(0, w as isize - 1) as usize];
+                let (xi, yi) = (x as isize, y as isize);
+                let lap = 4.0 * at(xi, yi) - at(xi - 1, yi) - at(xi + 1, yi) - at(xi, yi - 1) - at(xi, yi + 1);
+                *e = lap.abs();
+            }
+        });
+    }
+    let radius = (w.max(h) as f32 / 60.0).max(3.0);
+    let blurred = crate::filters::gaussian_blur_gray(&energy, w, h, radius);
+    let max = blurred.iter().copied().fold(0.0f32, f32::max).max(1e-6);
+    let thresh = (1.0 - sensitivity.clamp(0.0, 1.0)) * 0.5;
+    let bytes: Vec<u8> = blurred
+        .iter()
+        .map(|v| {
+            let t = ((v / max - thresh) / 0.08).clamp(0.0, 1.0);
+            (t * 255.0) as u8
+        })
+        .collect();
+    let mut m = Mask::from_dense(w as u32, h as u32, &bytes);
+    m.optimize();
+    m
+}
+
+/// Single Row / Single Column Marquee.
+pub fn row_mask(w: u32, h: u32, y: i32) -> Mask {
+    rect_mask(w, h, IRect::new(0, y, w as i32, y + 1))
+}
+
+pub fn column_mask(w: u32, h: u32, x: i32) -> Mask {
+    rect_mask(w, h, IRect::new(x, 0, x + 1, h as i32))
+}
+
+/// Magnetic Lasso helper: moves `p` to the strongest edge within `radius`.
+pub fn snap_to_edge(src: &TiledBuffer<crate::color::Rgba8>, p: Point, radius: i32) -> Point {
+    let l = |x: i32, y: i32| {
+        let c = src.get(x, y);
+        crate::color::lum([c[0] as f32, c[1] as f32, c[2] as f32]) * c[3] as f32 / 255.0
+    };
+    let (cx, cy) = (p.x.floor() as i32, p.y.floor() as i32);
+    let mut best = (0.0f32, p);
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let (x, y) = (cx + dx, cy + dy);
+            let gx = l(x + 1, y) - l(x - 1, y);
+            let gy = l(x, y + 1) - l(x, y - 1);
+            // Prefer closer pixels when edges are equally strong.
+            let g = (gx * gx + gy * gy).sqrt() / (1.0 + 0.05 * ((dx * dx + dy * dy) as f32).sqrt());
+            if g > best.0 {
+                best = (g, Point::new(x as f32 + 0.5, y as f32 + 0.5));
+            }
+        }
+    }
+    if best.0 > 8.0 {
+        best.1
+    } else {
+        p
+    }
+}
+
 /// Combines an existing selection with a new shape.
 /// Returns `None` when the result selects nothing.
 pub fn combine(existing: Option<&Mask>, new: Mask, op: SelectionOp) -> Option<Mask> {
@@ -323,6 +415,24 @@ mod tests {
         let e = ellipse_mask(64, 64, IRect::new(0, 0, 64, 64));
         assert_eq!(e.get(32, 32), 255);
         assert_eq!(e.get(0, 0), 0);
+    }
+
+    #[test]
+    fn color_range_and_rows() {
+        let mut img = TiledBuffer::solid(10, 10, [0, 0, 255, 255]);
+        img.set(3, 3, [255, 0, 0, 255]);
+        let m = color_range(&img, [255, 0, 0, 255], 40.0);
+        assert_eq!(m.get(3, 3), 255);
+        assert_eq!(m.get(4, 4), 0);
+        assert_eq!(row_mask(10, 10, 4).content_bounds(), Some(IRect::new(0, 4, 10, 5)));
+        let mut edge = TiledBuffer::solid(20, 20, [0, 0, 0, 255]);
+        for y in 0..20 {
+            for x in 10..20 {
+                edge.set(x, y, [255, 255, 255, 255]);
+            }
+        }
+        let p = snap_to_edge(&edge, Point::new(7.5, 10.5), 4);
+        assert!((p.x - 9.5).abs() <= 1.0, "{p:?}");
     }
 
     #[test]

@@ -15,6 +15,8 @@
 //! * **Photoshop-compatible blending**: all 27 Photoshop blend modes,
 //!   implemented after the W3C Compositing & Blending spec.
 
+#![allow(clippy::needless_range_loop, clippy::too_many_arguments)]
+
 pub mod adjust;
 pub mod blend;
 pub mod brush;
@@ -27,7 +29,9 @@ pub mod filters;
 pub mod geom;
 pub mod history;
 pub mod layer;
+pub mod retouch;
 pub mod selection;
+pub mod styles;
 pub mod transform;
 
 pub use blend::BlendMode;

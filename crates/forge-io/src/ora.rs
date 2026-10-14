@@ -42,6 +42,89 @@ fn png_gray(px: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
     Ok(out.into_inner())
 }
 
+fn forge_attrs(layer: &Layer, xml: &mut String) {
+    if layer.fill < 1.0 {
+        xml.push_str(&format!(" forge:fill=\"{:.4}\"", layer.fill));
+    }
+    if layer.clipped {
+        xml.push_str(" forge:clipped=\"true\"");
+    }
+    if layer.label != 0 {
+        xml.push_str(&format!(" forge:label=\"{}\"", layer.label));
+    }
+    if let Some(style) = &layer.style {
+        if let Ok(json) = serde_json::to_string(style) {
+            xml.push_str(&format!(" forge:style=\"{}\"", escape(&json)));
+        }
+    }
+}
+
+fn write_stack(
+    state: &DocState,
+    parent: Option<u64>,
+    zip: &mut ZipWriter<Cursor<Vec<u8>>>,
+    xml: &mut String,
+    w: u32,
+    h: u32,
+    indent: usize,
+) -> Result<()> {
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let pad = "  ".repeat(indent);
+    for (i, layer) in state.layers.iter().enumerate().rev() {
+        if layer.parent != parent {
+            continue;
+        }
+        if layer.is_group() {
+            xml.push_str(&format!(
+                "{pad}<stack name=\"{}\" opacity=\"{:.4}\" visibility=\"{}\" composite-op=\"{}\" isolation=\"isolate\"",
+                escape(&layer.name),
+                layer.opacity,
+                if layer.visible { "visible" } else { "hidden" },
+                layer.blend.ora_name(),
+            ));
+            if layer.collapsed {
+                xml.push_str(" forge:collapsed=\"true\"");
+            }
+            forge_attrs(layer, xml);
+            xml.push_str(">\n");
+            write_stack(state, Some(layer.id), zip, xml, w, h, indent + 1)?;
+            xml.push_str(&format!("{pad}</stack>\n"));
+            continue;
+        }
+        let bounds = layer.pixels.content_bounds().unwrap_or(IRect::new(0, 0, 1, 1));
+        let px = layer.pixels.region_to_dense(bounds);
+        let src = format!("data/layer{i}.png");
+        let data = png_rgba(&px, bounds.width() as u32, bounds.height() as u32)?;
+        zip.start_file(&src, stored)?; // PNG is already compressed
+        zip.write_all(&data)?;
+        xml.push_str(&format!(
+            "{pad}<layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{:.4}\" visibility=\"{}\" composite-op=\"{}\"",
+            escape(&layer.name),
+            bounds.x0,
+            bounds.y0,
+            layer.opacity,
+            if layer.visible { "visible" } else { "hidden" },
+            layer.blend.ora_name(),
+        ));
+        if layer.lock_alpha {
+            xml.push_str(" forge:lock-alpha=\"true\"");
+        }
+        if layer.locked {
+            xml.push_str(" edit-locked=\"true\"");
+        }
+        forge_attrs(layer, xml);
+        if let Some(mask) = &layer.mask {
+            let msrc = format!("data/mask{i}.png");
+            let data = png_gray(&mask.to_dense(), w, h)?;
+            zip.start_file(&msrc, stored)?;
+            zip.write_all(&data)?;
+            xml.push_str(&format!(" forge:mask=\"{msrc}\" forge:mask-enabled=\"{}\"", layer.mask_enabled));
+        }
+        xml.push_str(" />\n");
+    }
+    Ok(())
+}
+
 /// Serialises a document as an OpenRaster archive.
 pub fn write_ora(state: &DocState) -> Result<Vec<u8>> {
     let (w, h) = (state.width, state.height);
@@ -64,38 +147,8 @@ pub fn write_ora(state: &DocState) -> Result<Vec<u8>> {
     }
     xml.push_str(&format!(" forge:active=\"{}\">\n<stack>\n", state.active));
 
-    // OpenRaster lists the top-most layer first.
-    for (i, layer) in state.layers.iter().enumerate().rev() {
-        let bounds = layer.pixels.content_bounds().unwrap_or(IRect::new(0, 0, 1, 1));
-        let px = layer.pixels.region_to_dense(bounds);
-        let src = format!("data/layer{i}.png");
-        let data = png_rgba(&px, bounds.width() as u32, bounds.height() as u32)?;
-        zip.start_file(&src, stored)?; // PNG is already compressed
-        zip.write_all(&data)?;
-        xml.push_str(&format!(
-            "  <layer name=\"{}\" src=\"{src}\" x=\"{}\" y=\"{}\" opacity=\"{:.4}\" visibility=\"{}\" composite-op=\"{}\"",
-            escape(&layer.name),
-            bounds.x0,
-            bounds.y0,
-            layer.opacity,
-            if layer.visible { "visible" } else { "hidden" },
-            layer.blend.ora_name(),
-        ));
-        if layer.lock_alpha {
-            xml.push_str(" forge:lock-alpha=\"true\"");
-        }
-        if layer.locked {
-            xml.push_str(" edit-locked=\"true\"");
-        }
-        if let Some(mask) = &layer.mask {
-            let msrc = format!("data/mask{i}.png");
-            let data = png_gray(&mask.to_dense(), w, h)?;
-            zip.start_file(&msrc, stored)?;
-            zip.write_all(&data)?;
-            xml.push_str(&format!(" forge:mask=\"{msrc}\" forge:mask-enabled=\"{}\"", layer.mask_enabled));
-        }
-        xml.push_str(" />\n");
-    }
+    // OpenRaster lists the top-most layer first; groups are nested stacks.
+    write_stack(state, None, &mut zip, &mut xml, w, h, 1)?;
     xml.push_str("</stack>\n</image>\n");
     zip.start_file("stack.xml", deflated)?;
     zip.write_all(xml.as_bytes())?;
@@ -130,6 +183,66 @@ fn decode_gray(bytes: &[u8], w: u32, h: u32, fill: u8) -> Result<TiledBuffer<u8>
     Ok(m)
 }
 
+fn read_common(node: roxmltree::Node, layer: &mut Layer) {
+    layer.opacity = node.attribute("opacity").and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0).clamp(0.0, 1.0);
+    layer.visible = node.attribute("visibility") != Some("hidden");
+    layer.blend = node.attribute("composite-op").and_then(BlendMode::from_ora_name).unwrap_or_default();
+    layer.fill = node.attribute((FORGE_NS, "fill")).and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    layer.clipped = node.attribute((FORGE_NS, "clipped")) == Some("true");
+    layer.label = node.attribute((FORGE_NS, "label")).and_then(|v| v.parse().ok()).unwrap_or(0);
+    layer.style = node.attribute((FORGE_NS, "style")).and_then(|v| serde_json::from_str(v).ok());
+}
+
+/// Reads the children of a `<stack>` (top-most first) into `state`, bottom-first.
+fn read_stack(
+    stack: roxmltree::Node,
+    parent: Option<u64>,
+    zip: &mut ZipArchive<Cursor<&[u8]>>,
+    state: &mut DocState,
+    w: u32,
+    h: u32,
+) -> Result<()> {
+    let children: Vec<roxmltree::Node> = stack.children().filter(|c| c.is_element()).collect();
+    for node in children.into_iter().rev() {
+        match node.tag_name().name() {
+            "stack" => {
+                let id = state.alloc_id();
+                let mut g = Layer::new_group(id, node.attribute("name").unwrap_or("Group"), w, h);
+                read_common(node, &mut g);
+                g.collapsed = node.attribute((FORGE_NS, "collapsed")) == Some("true");
+                g.parent = parent;
+                read_stack(node, Some(id), zip, state, w, h)?;
+                state.layers.push(g);
+            }
+            "layer" => {
+                let Some(src) = node.attribute("src") else { continue };
+                if !src.to_ascii_lowercase().ends_with(".png") {
+                    continue; // e.g. SVG layers: unsupported
+                }
+                let data = read_entry(zip, src)?;
+                let img = decode_image(&data)?;
+                let x = node.attribute("x").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+                let y = node.attribute("y").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
+                let pixels = forge_core::transform::translate(&img, x, y, w, h);
+                let id = state.alloc_id();
+                let mut layer = Layer::with_pixels(id, node.attribute("name").unwrap_or("Layer"), pixels);
+                read_common(node, &mut layer);
+                layer.lock_alpha = node.attribute((FORGE_NS, "lock-alpha")) == Some("true");
+                layer.locked = node.attribute("edit-locked") == Some("true");
+                layer.parent = parent;
+                if let Some(msrc) = node.attribute((FORGE_NS, "mask")) {
+                    let data = read_entry(zip, msrc)?;
+                    layer.mask = Some(decode_gray(&data, w, h, 255)?);
+                    layer.mask_enabled = node.attribute((FORGE_NS, "mask-enabled")) != Some("false");
+                }
+                state.layers.push(layer);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// Parses an OpenRaster archive.
 pub fn read_ora(bytes: &[u8]) -> Result<DocState> {
     let mut zip = ZipArchive::new(Cursor::new(bytes))?;
@@ -148,44 +261,7 @@ pub fn read_ora(bytes: &[u8]) -> Result<DocState> {
         state.selection = m.content_bounds().map(|_| m);
     }
 
-    // Collect layers top-to-bottom; nested stacks (groups from other apps)
-    // are flattened into the list.
-    let mut nodes = Vec::new();
-    fn collect<'a, 'i>(n: roxmltree::Node<'a, 'i>, out: &mut Vec<roxmltree::Node<'a, 'i>>) {
-        for c in n.children().filter(|c| c.is_element()) {
-            match c.tag_name().name() {
-                "layer" => out.push(c),
-                "stack" => collect(c, out),
-                _ => {}
-            }
-        }
-    }
-    collect(root, &mut nodes);
-
-    for node in nodes.into_iter().rev() {
-        let Some(src) = node.attribute("src") else { continue };
-        if !src.to_ascii_lowercase().ends_with(".png") {
-            continue; // e.g. SVG layers: unsupported
-        }
-        let data = read_entry(&mut zip, src)?;
-        let img = decode_image(&data)?;
-        let x = node.attribute("x").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
-        let y = node.attribute("y").and_then(|v| v.parse::<i32>().ok()).unwrap_or(0);
-        let pixels = forge_core::transform::translate(&img, x, y, w, h);
-        let id = state.alloc_id();
-        let mut layer = Layer::with_pixels(id, node.attribute("name").unwrap_or("Layer"), pixels);
-        layer.opacity = node.attribute("opacity").and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0).clamp(0.0, 1.0);
-        layer.visible = node.attribute("visibility") != Some("hidden");
-        layer.blend = node.attribute("composite-op").and_then(BlendMode::from_ora_name).unwrap_or_default();
-        layer.lock_alpha = node.attribute((FORGE_NS, "lock-alpha")) == Some("true");
-        layer.locked = node.attribute("edit-locked") == Some("true");
-        if let Some(msrc) = node.attribute((FORGE_NS, "mask")) {
-            let data = read_entry(&mut zip, msrc)?;
-            layer.mask = Some(decode_gray(&data, w, h, 255)?);
-            layer.mask_enabled = node.attribute((FORGE_NS, "mask-enabled")) != Some("false");
-        }
-        state.layers.push(layer);
-    }
+    read_stack(root.children().find(|c| c.has_tag_name("stack")).unwrap_or(root), None, &mut zip, &mut state, w, h)?;
     if state.layers.is_empty() {
         let id = state.alloc_id();
         state.layers.push(Layer::new(id, "Background", w, h));

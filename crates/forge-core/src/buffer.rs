@@ -369,6 +369,17 @@ impl<P: Pixel> TiledBuffer<P> {
         r
     }
 
+    /// Cheap identity of the current contents: changes whenever any tile is
+    /// written (copy-on-write gives modified tiles a new allocation).
+    pub fn fingerprint(&self) -> usize {
+        let mut h = ((self.width as usize) << 32) ^ self.height as usize;
+        for (i, t) in self.tiles.iter().enumerate() {
+            let p = t.as_ref().map_or(0, |a| Arc::as_ptr(a) as usize);
+            h = h.rotate_left(5) ^ p ^ i;
+        }
+        h
+    }
+
     /// Creates a buffer of another size where each pixel is computed by `f(x, y)`.
     pub fn from_fn_par(width: u32, height: u32, fill: P, f: impl Fn(i32, i32) -> P + Sync) -> Self {
         let mut b = Self::new_filled(width, height, fill);
