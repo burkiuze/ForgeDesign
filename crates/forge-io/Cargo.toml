@@ -1,0 +1,15 @@
+[package]
+name = "forge-io"
+description = "Forge Design file formats: OpenRaster (.ora), PSD import, raster import/export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+image = "0.25"
+psd = "0.3"
+roxmltree = "0.21"
+thiserror = "2"
+zip = { version = "9", default-features = false, features = ["deflate"] }

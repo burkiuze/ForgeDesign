@@ -1,0 +1,18 @@
+[package]
+name = "forge-app"
+description = "Forge Design desktop application"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "forge"
+path = "src/main.rs"
+
+[dependencies]
+forge-core = { path = "../forge-core" }
+forge-io = { path = "../forge-io" }
+eframe = "0.29"
+ab_glyph = "0.2"
+rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster", "wayland"] }

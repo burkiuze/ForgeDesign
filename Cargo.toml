@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/forge-core", "crates/forge-io", "crates/forge-app", "crates/forge-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/burkiuze/ForgeDesign"
+authors = ["Forge Design contributors"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+
+# Image processing is painfully slow without optimisations, even while developing.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

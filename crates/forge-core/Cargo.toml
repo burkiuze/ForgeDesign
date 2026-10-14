@@ -1,0 +1,11 @@
+[package]
+name = "forge-core"
+description = "Forge Design core engine: tiled buffers, layers, blend modes, painting, filters"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rayon = "1.12"
+serde = { version = "1", features = ["derive"] }
