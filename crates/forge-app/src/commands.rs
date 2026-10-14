@@ -136,6 +136,9 @@ pub enum Cmd {
     Proof(ProofSer),
     Fullscreen,
     TogglePanels,
+    ShowPanel(crate::app::PanelId),
+    AddFont,
+    CloseAll,
     ToggleTheme,
     // Help
     About,
@@ -380,6 +383,9 @@ fn recordable(c: Cmd) -> bool {
             | Cmd::ActualPixels
             | Cmd::Fullscreen
             | Cmd::TogglePanels
+            | Cmd::ShowPanel(_)
+            | Cmd::AddFont
+            | Cmd::CloseAll
             | Cmd::ToggleTheme
             | Cmd::ToggleRulers
             | Cmd::ToggleGrid
@@ -580,6 +586,21 @@ impl ForgeApp {
             Cmd::Fullscreen => {
                 self.fullscreen = !self.fullscreen;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+                return;
+            }
+            Cmd::ShowPanel(id) => {
+                self.hide_panels = false;
+                self.panels.focus(id);
+                return;
+            }
+            Cmd::AddFont => return self.add_font_dialog(),
+            Cmd::CloseAll => {
+                for i in (0..self.tabs.len()).rev() {
+                    self.request_close_tab(i);
+                    if self.dialog.is_some() {
+                        break;
+                    }
+                }
                 return;
             }
             Cmd::TogglePanels => {
@@ -855,7 +876,7 @@ impl ForgeApp {
                 }
                 l.parent = tab.doc.state.active_layer().and_then(|a| a.parent);
                 tab.doc.add_layer(l, "New Adjustment Layer");
-                self.panels.properties = true;
+                self.panels.focus(crate::app::PanelId::Properties);
             }
             Cmd::NewFillLayer(kind) => {
                 let id = tab.doc.state.alloc_id();
@@ -964,7 +985,7 @@ impl ForgeApp {
                     tab.doc.state.paths.push(p);
                     tab.doc.state.active_path = Some(tab.doc.state.paths.len() - 1);
                     tab.doc.commit("Make Work Path");
-                    self.panels.paths = true;
+                    self.panels.focus(crate::app::PanelId::Paths);
                 }
             }
             Cmd::ZoomIn => tab.view.zoom_step(1, None, w, h),
@@ -980,7 +1001,10 @@ impl ForgeApp {
             Cmd::ToggleSnap => tab.view.snap = !tab.view.snap,
             Cmd::ClearGuides => tab.view.guides.clear(),
             Cmd::NewGuide => self.dialog = Some(Dialog::NewGuide(dialogs::NewGuideDialog::default())),
-            Cmd::Proof(p) => tab.view.proof = p.proof(),
+            Cmd::Proof(p) => {
+                let p = p.proof();
+                tab.view.proof = if tab.view.proof == p { Proof::Off } else { p };
+            }
             _ => {}
         }
     }
@@ -996,36 +1020,56 @@ impl ForgeApp {
         let cas = Modifiers::COMMAND | Modifiers::ALT | Modifiers::SHIFT;
         let free = Cmd::Transform(TransformModeSer::of(TransformMode::Free));
         // Most specific modifier combinations first: egui matches "logically".
+        let a = Modifiers::ALT;
+        let s = Modifiers::SHIFT;
+        let n = Modifiers::NONE;
+        let feather = Cmd::SelModify(SelModifyKindSer::of(SelModifyKind::Feather));
+        let cmyk = Cmd::Proof(ProofSer::of(Proof::Cmyk));
+        // Adobe Photoshop default keyboard shortcuts (Windows; Ctrl = Cmd on macOS).
+        // Most specific modifier combinations first: egui matches "logically".
         let table: Vec<(Modifiers, Key, Cmd)> = vec![
-            (cas, B, Cmd::Adjust(7)),
-            (cas, E, Cmd::StampVisible),
-            (cas, N, Cmd::NewLayer),
+            // Alt+Shift+Ctrl
+            (cas, B, Cmd::Adjust(7)),           // Black & White
+            (cas, E, Cmd::StampVisible),        // Stamp visible
+            (cas, N, Cmd::NewLayer),            // New layer (no dialog)
+            (cas, L, Cmd::AutoContrast),        // Auto Contrast
+            (cas, K, Cmd::Shortcuts),           // Keyboard Shortcuts
+            (cas, I, Cmd::ImageSize),           // (File Info in PS; harmless)
+            (cas, S, Cmd::Export),              // Save for Web
+            (cas, W, Cmd::Export),              // Export As
+            (cas, Z, Cmd::Undo),
+            // Shift+Ctrl
             (cs, Z, Cmd::Redo),
             (cs, S, Cmd::SaveAs),
-            (cs, E, Cmd::MergeVisible),
             (cs, N, Cmd::NewLayer),
+            (cs, E, Cmd::MergeVisible),
             (cs, I, Cmd::Inverse),
             (cs, C, Cmd::CopyMerged),
-            (cs, U, Cmd::Adjust(13)),
+            (cs, V, Cmd::Paste),                // Paste in Place
+            (cs, U, Cmd::Adjust(13)),           // Desaturate
             (cs, L, Cmd::AutoTone),
             (cs, B, Cmd::AutoColor),
             (cs, G, Cmd::Ungroup),
             (cs, J, Cmd::LayerViaCut),
             (cs, D, Cmd::Reselect),
             (cs, X, Cmd::Liquify),
-            (cs, R, Cmd::Fit),
+            (cs, A, Cmd::Filter(26)),           // Camera Raw-like lens/lighting
             (cs, CloseBracket, Cmd::LayerTop),
             (cs, OpenBracket, Cmd::LayerBottom),
-            (cs, Slash, Cmd::Shortcuts),
             (cs, Semicolon, Cmd::ToggleSnap),
+            // Alt+Ctrl
             (ca, I, Cmd::ImageSize),
             (ca, C, Cmd::CanvasSize),
             (ca, G, Cmd::ToggleClip),
-            (ca, L, Cmd::AutoContrast),
-            (ca, W, Cmd::ExportPdf),
+            (ca, W, Cmd::CloseAll),
             (ca, Num0, Cmd::ActualPixels),
+            (ca, Z, Cmd::Undo),
+            (ca, R, feather),                   // Select and Mask
+            (ca, D, feather),                   // Feather (legacy)
+            (ca, E, Cmd::StampVisible),         // Merge (copy) to new layer
+            (ca, F, Cmd::RepeatFilter),
+            // Ctrl
             (cmd, Z, Cmd::Undo),
-            (cmd, Y, Cmd::Redo),
             (cmd, N, Cmd::New),
             (cmd, O, Cmd::Open),
             (cmd, S, Cmd::Save),
@@ -1040,13 +1084,15 @@ impl ForgeApp {
             (cmd, E, Cmd::MergeDown),
             (cmd, G, Cmd::GroupLayers),
             (cmd, T, free),
-            (cmd, L, Cmd::Adjust(1)),
-            (cmd, M, Cmd::Adjust(2)),
-            (cmd, U, Cmd::Adjust(5)),
-            (cmd, B, Cmd::Adjust(6)),
-            (cmd, I, Cmd::Adjust(10)),
-            (cmd, F, Cmd::RepeatFilter),
+            (cmd, L, Cmd::Adjust(1)),           // Levels
+            (cmd, M, Cmd::Adjust(2)),           // Curves
+            (cmd, U, Cmd::Adjust(5)),           // Hue/Saturation
+            (cmd, B, Cmd::Adjust(6)),           // Color Balance
+            (cmd, I, Cmd::Adjust(10)),          // Invert
+            (cmd, F, Cmd::RepeatFilter),        // Last Filter (older PS)
+            (cmd, Y, cmyk),                     // Proof Colors
             (cmd, R, Cmd::ToggleRulers),
+            (cmd, H, Cmd::ToggleGuides),        // Extras
             (cmd, Quote, Cmd::ToggleGrid),
             (cmd, Semicolon, Cmd::ToggleGuides),
             (cmd, CloseBracket, Cmd::LayerUp),
@@ -1057,12 +1103,20 @@ impl ForgeApp {
             (cmd, Num0, Cmd::Fit),
             (cmd, Num1, Cmd::ActualPixels),
             (cmd, Backspace, Cmd::FillBg),
-            (Modifiers::SHIFT, Backspace, Cmd::FillDialog),
-            (Modifiers::SHIFT, F5, Cmd::FillDialog),
-            (Modifiers::SHIFT, F6, Cmd::SelModify(SelModifyKindSer::of(SelModifyKind::Feather))),
-            (Modifiers::ALT, Backspace, Cmd::FillFg),
-            (Modifiers::NONE, Delete, Cmd::Clear),
-            (Modifiers::NONE, F11, Cmd::Fullscreen),
+            (cmd, Delete, Cmd::FillBg),
+            // Shift / Alt / plain
+            (s, Backspace, Cmd::FillDialog),
+            (s, F5, Cmd::FillDialog),
+            (s, F6, feather),
+            (a, Backspace, Cmd::FillFg),
+            (a, Delete, Cmd::FillFg),
+            (a, F9, Cmd::ShowPanel(crate::app::PanelId::Actions)),
+            (n, F5, Cmd::ShowPanel(crate::app::PanelId::Brushes)),
+            (n, F6, Cmd::ShowPanel(crate::app::PanelId::Color)),
+            (n, F7, Cmd::ShowPanel(crate::app::PanelId::Layers)),
+            (n, F8, Cmd::ShowPanel(crate::app::PanelId::Info)),
+            (n, F12, Cmd::Revert),
+            (n, Delete, Cmd::Clear),
         ];
         if ctx.wants_keyboard_input() {
             return;
@@ -1115,6 +1169,22 @@ impl ForgeApp {
                 Key::Q => self.quick_mask(ctx),
                 Key::Tab => self.run(Cmd::TogglePanels, ctx),
                 Key::F => self.run(Cmd::Fullscreen, ctx),
+                Key::Comma | Key::Period if mods.alt => {
+                    // Alt+, / Alt+. select bottom / top layer.
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let i = if key == Key::Comma { 0 } else { tab.doc.state.layers.len().saturating_sub(1) };
+                        tab.doc.select_layer(i);
+                    }
+                }
+                Key::OpenBracket | Key::CloseBracket if mods.alt => {
+                    // Alt+[ / Alt+] select layer below / above.
+                    if let Some(tab) = self.tabs.get_mut(self.active) {
+                        let n = tab.doc.state.layers.len();
+                        let cur = tab.doc.state.active;
+                        let i = if key == Key::OpenBracket { cur.saturating_sub(1) } else { (cur + 1).min(n.saturating_sub(1)) };
+                        tab.doc.select_layer(i);
+                    }
+                }
                 Key::OpenBracket | Key::CloseBracket => {
                     let up = key == Key::CloseBracket;
                     if let Some(b) = self.tools.current_brush() {
@@ -1220,14 +1290,15 @@ impl ForgeApp {
                 item(ui, "Place Embedded…", "", Cmd::Place, has_doc);
                 ui.separator();
                 item(ui, "Close", "Ctrl+W", Cmd::Close, has_doc);
+                item(ui, "Close All", "Alt+Ctrl+W", Cmd::CloseAll, has_doc);
                 item(ui, "Save", "Ctrl+S", Cmd::Save, has_doc);
                 item(ui, "Save As… (ORA / PSD)", "Shift+Ctrl+S", Cmd::SaveAs, has_doc);
                 item(ui, "Revert", "", Cmd::Revert, has_doc);
                 ui.separator();
                 ui.menu_button("Export", |ui| {
                     item(ui, "Quick Export as PNG", "", Cmd::QuickExportPng, has_doc);
-                    item(ui, "Export As…", "", Cmd::Export, has_doc);
-                    item(ui, "Export to PDF…", "Alt+Ctrl+W", Cmd::ExportPdf, has_doc);
+                    item(ui, "Export As…", "Alt+Shift+Ctrl+W", Cmd::Export, has_doc);
+                    item(ui, "Export to PDF…", "", Cmd::ExportPdf, has_doc);
                     item(ui, "Layers to Files…", "", Cmd::ExportLayers, has_doc);
                     item(ui, "Animated GIF (frames from layers)…", "", Cmd::ExportGif, has_doc);
                 });
@@ -1460,25 +1531,31 @@ impl ForgeApp {
                 item(ui, if self.light_theme { "Dark Interface" } else { "Light Interface" }, "", Cmd::ToggleTheme, true);
             });
             ui.menu_button("Window", |ui| {
-                let p = &mut self.panels;
-                for (flag, name) in [
-                    (&mut p.actions, "Actions"),
-                    (&mut p.brushes, "Brushes"),
-                    (&mut p.color, "Color"),
-                    (&mut p.histogram, "Histogram"),
-                    (&mut p.history, "History"),
-                    (&mut p.info, "Info"),
-                    (&mut p.layers, "Layers"),
-                    (&mut p.navigator, "Navigator"),
-                    (&mut p.paths, "Paths"),
-                    (&mut p.properties, "Properties"),
-                    (&mut p.swatches, "Swatches"),
+                for (name, id, sc) in [
+                    ("Actions", crate::app::PanelId::Actions, "Alt+F9"),
+                    ("Adjustments", crate::app::PanelId::Adjustments, ""),
+                    ("Brushes", crate::app::PanelId::Brushes, "F5"),
+                    ("Channels", crate::app::PanelId::Channels, ""),
+                    ("Color", crate::app::PanelId::Color, "F6"),
+                    ("Gradients", crate::app::PanelId::Gradients, ""),
+                    ("Histogram", crate::app::PanelId::Histogram, ""),
+                    ("History", crate::app::PanelId::History, ""),
+                    ("Info", crate::app::PanelId::Info, "F8"),
+                    ("Layers", crate::app::PanelId::Layers, "F7"),
+                    ("Navigator", crate::app::PanelId::Navigator, ""),
+                    ("Paths", crate::app::PanelId::Paths, ""),
+                    ("Patterns", crate::app::PanelId::Patterns, ""),
+                    ("Properties", crate::app::PanelId::Properties, ""),
+                    ("Swatches", crate::app::PanelId::Swatches, ""),
                 ] {
-                    ui.checkbox(flag, name);
+                    let on = self.panels.is_front(id);
+                    item(ui, &format!("{}{name}", if on { "✔ " } else { "    " }), sc, Cmd::ShowPanel(id), true);
                 }
+                ui.separator();
+                item(ui, "Add Font…", "", Cmd::AddFont, true);
             });
             ui.menu_button("Help", |ui| {
-                item(ui, "Keyboard Shortcuts", "Shift+Ctrl+/", Cmd::Shortcuts, true);
+                item(ui, "Keyboard Shortcuts…", "Alt+Shift+Ctrl+K", Cmd::Shortcuts, true);
                 item(ui, "About Forge Design", "", Cmd::About, true);
             });
         });

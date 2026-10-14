@@ -26,7 +26,8 @@ pub fn toolbar(ui: &mut egui::Ui, tools: &mut ToolState, editing_bg: &mut bool) 
     ui.spacing_mut().item_spacing = Vec2::splat(2.0);
     let size = Vec2::splat(30.0);
     let groups: Vec<usize> = (0..GROUPS.len()).collect();
-    for pair in groups.chunks(2) {
+    // Single column, like Photoshop's default tool bar.
+    for pair in groups.chunks(1) {
         ui.horizontal(|ui| {
             for &gi in pair {
                 let group = GROUPS[gi];
@@ -92,9 +93,9 @@ pub fn toolbar(ui: &mut egui::Ui, tools: &mut ToolState, editing_bg: &mut bool) 
     ui.add_space(10.0);
 
     // Foreground / background swatches, Photoshop style.
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(62.0, 56.0), Sense::hover());
-    let fg_r = Rect::from_min_size(rect.min + Vec2::new(4.0, 4.0), Vec2::splat(30.0));
-    let bg_r = Rect::from_min_size(rect.min + Vec2::new(22.0, 22.0), Vec2::splat(30.0));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(36.0, 40.0), Sense::hover());
+    let fg_r = Rect::from_min_size(rect.min + Vec2::new(1.0, 2.0), Vec2::splat(22.0));
+    let bg_r = Rect::from_min_size(rect.min + Vec2::new(12.0, 14.0), Vec2::splat(22.0));
     let p = ui.painter();
     p.rect_filled(bg_r, 0.0, to_c32(tools.bg));
     p.rect_stroke(bg_r, 0.0, Stroke::new(1.0_f32, if *editing_bg { crate::app::ACCENT } else { Color32::from_gray(160) }));
@@ -107,14 +108,12 @@ pub fn toolbar(ui: &mut egui::Ui, tools: &mut ToolState, editing_bg: &mut bool) 
     } else if bg_resp.clicked() {
         *editing_bg = true;
     }
-    ui.horizontal(|ui| {
-        if ui.small_button("X").on_hover_text("Swap colours (X)").clicked() {
-            tools.swap_colors();
-        }
-        if ui.small_button("D").on_hover_text("Default colours (D)").clicked() {
-            tools.reset_colors();
-        }
-    });
+    if ui.small_button("⇅").on_hover_text("Swap colours (X)").clicked() {
+        tools.swap_colors();
+    }
+    if ui.small_button("D").on_hover_text("Default colours (D)").clicked() {
+        tools.reset_colors();
+    }
 }
 
 // ------------------------------------------------------------------ colour
@@ -1037,4 +1036,247 @@ pub fn history_panel(ui: &mut egui::Ui, tab: &mut DocTab) {
     if let Some(i) = jump {
         tab.doc.jump_history(i);
     }
+}
+
+// --------------------------------------------------------------- gradients
+
+pub fn gradient_presets() -> Vec<(&'static str, Vec<(f32, Color)>)> {
+    let h = |s: &str| Color::from_hex(s).unwrap_or(Color::BLACK);
+    vec![
+        ("Foreground → Background", vec![]),
+        ("Black → White", vec![(0.0, Color::BLACK), (1.0, Color::WHITE)]),
+        ("Spectrum", ["#ff0000", "#ffff00", "#00ff00", "#00ffff", "#0000ff", "#ff00ff", "#ff0000"].iter().enumerate().map(|(i, c)| (i as f32 / 6.0, h(c))).collect()),
+        ("Sunset", vec![(0.0, h("#2b1055")), (0.5, h("#d53369")), (1.0, h("#ffcc70"))]),
+        ("Ocean", vec![(0.0, h("#0f2027")), (0.5, h("#203a43")), (1.0, h("#2c97b5"))]),
+        ("Peach", vec![(0.0, h("#ffecd2")), (1.0, h("#fcb69f"))]),
+        ("Mint", vec![(0.0, h("#d4fc79")), (1.0, h("#96e6a1"))]),
+        ("Purple Haze", vec![(0.0, h("#7f00ff")), (1.0, h("#e100ff"))]),
+        ("Fire", vec![(0.0, h("#3a0000")), (0.4, h("#ff3c00")), (0.8, h("#ffb300")), (1.0, h("#fff5c0"))]),
+        ("Chrome", vec![(0.0, h("#333333")), (0.45, Color::WHITE), (0.55, h("#555555")), (1.0, h("#dddddd"))]),
+        ("Gold", vec![(0.0, h("#8a6623")), (0.5, h("#f6e27a")), (1.0, h("#9e7b2f"))]),
+        ("Copper", vec![(0.0, h("#4a2511")), (0.5, h("#e3a66b")), (1.0, h("#6b3517"))]),
+        ("Transparent Fade", vec![(0.0, Color::BLACK), (1.0, Color::BLACK.with_alpha(0.0))]),
+        ("Forge", vec![(0.0, h("#18171c")), (1.0, h("#c6f432"))]),
+        ("Sepia Toning", vec![(0.0, h("#2e1d0e")), (0.5, h("#a77b4f")), (1.0, h("#f4e7d1"))]),
+        ("Neon", vec![(0.0, h("#00f5ff")), (0.5, h("#ff00e1")), (1.0, h("#fff200"))]),
+    ]
+}
+
+fn paint_gradient(p: &egui::Painter, r: Rect, stops: &[(f32, Color)], fg: Color, bg: Color) {
+    let n = 48;
+    for i in 0..n {
+        let t = i as f32 / (n - 1) as f32;
+        let c = if stops.len() < 2 {
+            fg.lerp(bg, t)
+        } else {
+            let mut c = stops[stops.len() - 1].1;
+            if t <= stops[0].0 {
+                c = stops[0].1;
+            } else {
+                for w in stops.windows(2) {
+                    if t <= w[1].0 {
+                        c = w[0].1.lerp(w[1].1, (t - w[0].0) / (w[1].0 - w[0].0).max(1e-6));
+                        break;
+                    }
+                }
+            }
+            c
+        };
+        let x0 = r.left() + r.width() * i as f32 / n as f32;
+        let seg = Rect::from_min_max(Pos2::new(x0, r.top()), Pos2::new(x0 + r.width() / n as f32 + 0.5, r.bottom()));
+        let chk = if ((i / 2) % 2) == 0 { 200 } else { 150 };
+        p.rect_filled(seg, 0.0, Color32::from_gray(chk));
+        p.rect_filled(seg, 0.0, to_c32(c));
+    }
+}
+
+pub fn gradients_panel(ui: &mut egui::Ui, tools: &mut ToolState) {
+    ui.label(egui::RichText::new("Click a preset to use it with the Gradient tool (G).").weak());
+    egui::Grid::new("grad_presets").num_columns(2).spacing(Vec2::new(6.0, 6.0)).show(ui, |ui| {
+        for (k, (name, stops)) in gradient_presets().into_iter().enumerate() {
+            let (r, resp) = ui.allocate_exact_size(Vec2::new(120.0, 22.0), Sense::click());
+            paint_gradient(ui.painter(), r, &stops, tools.fg, tools.bg);
+            let active = tools.gradient_stops == stops;
+            ui.painter().rect_stroke(r, 2.0, Stroke::new(if active { 2.0_f32 } else { 1.0 }, if active { crate::app::ACCENT } else { Color32::from_gray(60) }));
+            if resp.on_hover_text(name).clicked() {
+                tools.gradient_stops = stops;
+                tools.select_tool(Tool::Gradient);
+            }
+            if k % 2 == 1 {
+                ui.end_row();
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Type:");
+        for k in forge_core::fill::GradientKind::ALL {
+            ui.selectable_value(&mut tools.gradient_kind, k, k.name());
+        }
+    });
+}
+
+// ---------------------------------------------------------------- patterns
+
+pub fn pattern_presets() -> Vec<(&'static str, TiledBuffer<[u8; 4]>)> {
+    let mk = |w: u32, h: u32, f: &(dyn Fn(i32, i32) -> [u8; 4] + Sync)| {
+        let mut b = TiledBuffer::new(w, h);
+        b.par_map_all(|x, y, _| f(x, y));
+        b
+    };
+    vec![
+        ("Checker", mk(16, 16, &|x, y| if (x / 8 + y / 8) % 2 == 0 { [60, 60, 60, 255] } else { [200, 200, 200, 255] })),
+        ("Stripes", mk(16, 16, &|x, y| if ((x + y) / 4) % 2 == 0 { [30, 30, 30, 255] } else { [240, 240, 240, 255] })),
+        ("Dots", mk(16, 16, &|x, y| { let (dx, dy) = (x - 8, y - 8); if dx * dx + dy * dy < 16 { [20, 20, 20, 255] } else { [245, 245, 245, 255] } })),
+        ("Grid", mk(20, 20, &|x, y| if x == 0 || y == 0 { [80, 80, 80, 255] } else { [250, 250, 250, 255] })),
+        ("Bricks", mk(32, 16, &|x, y| { let off = if y < 8 { 0 } else { 16 }; if y % 8 == 0 || (x + off) % 32 == 0 { [210, 200, 190, 255] } else { [160, 70, 50, 255] } })),
+        ("Noise", mk(64, 64, &|x, y| { let v = (forge_core::blend::pixel_noise(x, y) * 255.0) as u8; [v, v, v, 255] })),
+        ("Herringbone", mk(16, 16, &|x, y| if ((x + if (y / 4) % 2 == 0 { y } else { 16 - y }) / 4) % 2 == 0 { [90, 70, 50, 255] } else { [190, 160, 120, 255] })),
+        ("Diamonds", mk(16, 16, &|x, y| if (x - 8).abs() + (y - 8).abs() < 7 { [198, 244, 50, 255] } else { [24, 23, 28, 255] })),
+    ]
+}
+
+pub fn patterns_panel(ui: &mut egui::Ui, tools: &mut ToolState) {
+    ui.label(egui::RichText::new("Used by Pattern Stamp, Pattern Fill layers and Pattern Overlay. Edit > Define Pattern adds your own.").weak());
+    ui.horizontal_wrapped(|ui| {
+        for (name, pat) in pattern_presets() {
+            let (r, resp) = ui.allocate_exact_size(Vec2::splat(44.0), Sense::click());
+            let p = ui.painter();
+            let cells = 11;
+            for cy in 0..cells {
+                for cx in 0..cells {
+                    let px = pat.get((cx * 4) % pat.width() as i32, (cy * 4) % pat.height() as i32);
+                    let cr = Rect::from_min_size(r.min + Vec2::new(cx as f32 * 4.0, cy as f32 * 4.0), Vec2::splat(4.0));
+                    p.rect_filled(cr, 0.0, Color32::from_rgb(px[0], px[1], px[2]));
+                }
+            }
+            p.rect_stroke(r, 2.0, Stroke::new(1.0_f32, Color32::from_gray(80)));
+            if resp.on_hover_text(name).clicked() {
+                tools.pattern = std::sync::Arc::new(pat);
+                tools.status = format!("Pattern: {name}");
+            }
+        }
+    });
+    ui.label(format!("Current pattern: {} × {} px", tools.pattern.width(), tools.pattern.height()));
+}
+
+// ------------------------------------------------------------- adjustments
+
+pub fn adjustments_panel(ui: &mut egui::Ui, has_doc: bool) -> Option<Cmd> {
+    let mut out = None;
+    ui.label(egui::RichText::new("Add a non-destructive adjustment layer").weak());
+    let items: [(usize, &str, &str); 17] = [
+        (0, "☀", "Brightness/Contrast"),
+        (1, "▤", "Levels"),
+        (2, "〰", "Curves"),
+        (3, "±", "Exposure"),
+        (4, "▽", "Vibrance"),
+        (5, "◐", "Hue/Saturation"),
+        (6, "⚖", "Color Balance"),
+        (7, "◑", "Black & White"),
+        (8, "▣", "Photo Filter"),
+        (14, "⊞", "Channel Mixer"),
+        (17, "▦", "Color Lookup"),
+        (10, "◩", "Invert"),
+        (11, "▥", "Posterize"),
+        (12, "◧", "Threshold"),
+        (9, "▬", "Gradient Map"),
+        (15, "◎", "Selective Color"),
+        (16, "🌡", "Color Temperature"),
+    ];
+    egui::Grid::new("adj_grid").num_columns(4).spacing(Vec2::splat(4.0)).show(ui, |ui| {
+        for (k, (i, glyph, name)) in items.iter().enumerate() {
+            let b = egui::Button::new(egui::RichText::new(*glyph).size(18.0)).min_size(Vec2::new(56.0, 36.0));
+            if ui.add_enabled(has_doc, b).on_hover_text(*name).clicked() {
+                out = Some(Cmd::NewAdjLayer(*i));
+            }
+            if k % 4 == 3 {
+                ui.end_row();
+            }
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(egui::RichText::new("Presets").strong());
+    ui.horizontal_wrapped(|ui| {
+        for (name, cmd) in [("Auto Tone", Cmd::AutoTone), ("Auto Contrast", Cmd::AutoContrast), ("Auto Color", Cmd::AutoColor), ("B&W", Cmd::NewAdjLayer(7)), ("Warm", Cmd::NewAdjLayer(8))] {
+            if ui.add_enabled(has_doc, egui::Button::new(name)).clicked() {
+                out = Some(cmd);
+            }
+        }
+    });
+    out
+}
+
+// ---------------------------------------------------------------- channels
+
+pub fn channels_panel(ui: &mut egui::Ui, tab: &mut DocTab) -> Option<Cmd> {
+    let mut out = None;
+    let ctx = ui.ctx().clone();
+    let (w, h) = (tab.doc.width(), tab.doc.height());
+    let serial = tab.doc.history().current().serial as usize;
+    // Thumbnails of the composite and each colour channel.
+    let mut thumbs = Vec::new();
+    for ch in 0..4usize {
+        let key = (u64::MAX - 1000 - tab.id * 8 - ch as u64, true);
+        let id = match tab.view.thumbs.get(&key) {
+            Some((s, t)) if *s == serial => t.id(),
+            _ => {
+                let scale = 40.0 / w.max(h) as f32;
+                let (tw, th) = (((w as f32 * scale) as u32).max(1), ((h as f32 * scale) as u32).max(1));
+                let merged = forge_core::composite::merged(&tab.doc.state);
+                let small = forge_core::transform::resample_rgba(&merged, tw, th, forge_core::transform::Resample::Bilinear);
+                let pixels = small
+                    .to_dense()
+                    .iter()
+                    .map(|p| match ch {
+                        0 => Color32::from_rgb(p[0], p[1], p[2]),
+                        k => Color32::from_gray(p[k - 1]),
+                    })
+                    .collect();
+                let t = ctx.load_texture(format!("chan{ch}"), egui::ColorImage { size: [tw as usize, th as usize], pixels }, TextureOptions::LINEAR);
+                let id = t.id();
+                tab.view.thumbs.insert(key, (serial, t));
+                id
+            }
+        };
+        thumbs.push(id);
+    }
+    for (ch, name) in ["RGB", "Red", "Green", "Blue"].iter().enumerate() {
+        ui.horizontal(|ui| {
+            let (r, resp) = ui.allocate_exact_size(Vec2::splat(40.0), Sense::click());
+            ui.painter().image(thumbs[ch], r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            ui.label(*name);
+            if ch > 0 {
+                ui.label(egui::RichText::new(format!("Ctrl+{}", ch + 2)).weak());
+            }
+            if resp.clicked() && ch > 0 {
+                // Load the channel's luminosity as a selection (Ctrl+click in PS).
+                let merged = forge_core::composite::merged(&tab.doc.state);
+                let m = forge_core::selection::Mask::from_fn_par(w, h, 0, |x, y| merged.get(x, y)[ch - 1]);
+                tab.doc.set_selection(m.content_bounds().map(|_| m));
+                tab.doc.commit(format!("Load {name} Channel"));
+            }
+        });
+    }
+    ui.label(egui::RichText::new("Click a colour channel to load it as a selection.").weak());
+    ui.separator();
+    ui.label(egui::RichText::new("Alpha channels (saved selections)").strong());
+    let mut remove = None;
+    for (i, (name, _)) in tab.channels.iter().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label(format!("▣ {name}"));
+            if ui.small_button("Load").clicked() {
+                out = Some(Cmd::LoadSelection(i));
+            }
+            if ui.small_button("✖").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    if let Some(i) = remove {
+        tab.channels.remove(i);
+    }
+    if ui.add_enabled(tab.doc.selection().is_some(), egui::Button::new("Save selection as channel")).clicked() {
+        out = Some(Cmd::SaveSelection);
+    }
+    out
 }

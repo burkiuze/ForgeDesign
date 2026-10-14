@@ -59,37 +59,99 @@ pub struct Clip {
     pub origin: IRect,
 }
 
-/// Which panels are shown (Window menu).
+/// Right-hand panels, arranged in tabbed groups like Photoshop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PanelId {
+    Color,
+    Swatches,
+    Gradients,
+    Patterns,
+    Properties,
+    Adjustments,
+    Info,
+    Navigator,
+    Histogram,
+    Layers,
+    Channels,
+    Paths,
+    History,
+    Actions,
+    Brushes,
+}
+
+impl PanelId {
+    pub fn name(self) -> &'static str {
+        match self {
+            PanelId::Color => "Color",
+            PanelId::Swatches => "Swatches",
+            PanelId::Gradients => "Gradients",
+            PanelId::Patterns => "Patterns",
+            PanelId::Properties => "Properties",
+            PanelId::Adjustments => "Adjustments",
+            PanelId::Info => "Info",
+            PanelId::Navigator => "Navigator",
+            PanelId::Histogram => "Histogram",
+            PanelId::Layers => "Layers",
+            PanelId::Channels => "Channels",
+            PanelId::Paths => "Paths",
+            PanelId::History => "History",
+            PanelId::Actions => "Actions",
+            PanelId::Brushes => "Brushes",
+        }
+    }
+}
+
+pub const PANEL_GROUPS: [&[PanelId]; 4] = [
+    &[PanelId::Color, PanelId::Swatches, PanelId::Gradients, PanelId::Patterns],
+    &[PanelId::Properties, PanelId::Adjustments, PanelId::Info, PanelId::Navigator, PanelId::Histogram],
+    &[PanelId::Layers, PanelId::Channels, PanelId::Paths],
+    &[PanelId::History, PanelId::Actions, PanelId::Brushes],
+];
+
+/// Selected tab and collapsed state of each panel group.
 pub struct Panels {
-    pub color: bool,
-    pub swatches: bool,
-    pub histogram: bool,
-    pub navigator: bool,
-    pub info: bool,
-    pub properties: bool,
-    pub layers: bool,
-    pub paths: bool,
-    pub history: bool,
-    pub actions: bool,
-    pub brushes: bool,
+    pub tabs: [usize; 4],
+    pub collapsed: [bool; 4],
 }
 
 impl Default for Panels {
     fn default() -> Self {
-        Self {
-            color: true,
-            swatches: false,
-            histogram: false,
-            navigator: true,
-            info: false,
-            properties: true,
-            layers: true,
-            paths: false,
-            history: true,
-            actions: false,
-            brushes: false,
+        Self { tabs: [0, 0, 0, 0], collapsed: [false; 4] }
+    }
+}
+
+impl Panels {
+    /// Brings a panel to the front of its group (Window menu, F-keys).
+    pub fn focus(&mut self, id: PanelId) {
+        for (g, group) in PANEL_GROUPS.iter().enumerate() {
+            if let Some(i) = group.iter().position(|p| *p == id) {
+                self.tabs[g] = i;
+                self.collapsed[g] = false;
+            }
         }
     }
+
+    pub fn is_front(&self, id: PanelId) -> bool {
+        PANEL_GROUPS.iter().enumerate().any(|(g, group)| group.get(self.tabs[g]) == Some(&id))
+    }
+}
+
+fn config_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
+    Some(base.join("forge-design"))
+}
+
+fn load_recent() -> Vec<PathBuf> {
+    config_dir()
+        .and_then(|d| std::fs::read_to_string(d.join("recent.json")).ok())
+        .and_then(|s| serde_json::from_str::<Vec<PathBuf>>(&s).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect()
 }
 
 pub struct ForgeApp {
@@ -114,6 +176,7 @@ pub struct ForgeApp {
     pub hide_panels: bool,
     pub light_theme: bool,
     last_autosave: Instant,
+    pub recent: Vec<PathBuf>,
 }
 
 fn recovery_dir() -> PathBuf {
@@ -151,6 +214,7 @@ impl ForgeApp {
             hide_panels: false,
             light_theme: false,
             last_autosave: Instant::now(),
+            recent: load_recent(),
         };
         for f in files {
             app.open_path(&f);
@@ -175,9 +239,50 @@ impl ForgeApp {
     }
 
     pub fn open_path(&mut self, path: &Path) {
+        if crate::text::is_font_file(path) {
+            return self.add_font(path);
+        }
         match forge_io::open(path) {
-            Ok(doc) => self.add_tab(doc),
+            Ok(doc) => {
+                self.add_tab(doc);
+                self.remember(path);
+            }
             Err(e) => self.error(format!("Could not open {}:\n{e}", path.display())),
+        }
+    }
+
+    /// Adds a file to Recent Projects.
+    pub fn remember(&mut self, path: &Path) {
+        let p = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.recent.retain(|r| *r != p);
+        self.recent.insert(0, p);
+        self.recent.truncate(20);
+        if let Some(d) = config_dir() {
+            let _ = std::fs::create_dir_all(&d);
+            if let Ok(s) = serde_json::to_string_pretty(&self.recent) {
+                let _ = std::fs::write(d.join("recent.json"), s);
+            }
+        }
+    }
+
+    /// Installs a .ttf/.otf font (Type > Add Font, or drag & drop).
+    pub fn add_font(&mut self, path: &Path) {
+        match crate::text::install_font(path) {
+            Ok(entry) => {
+                self.tools.status = format!("Font installed: {}", entry.name);
+                self.fonts = crate::text::discover_fonts();
+                if let Some(i) = self.fonts.iter().position(|f| f.path == entry.path) {
+                    self.tools.font_index = i;
+                }
+            }
+            Err(e) => self.error(format!("Could not add font {}:\n{e}", path.display())),
+        }
+    }
+
+    pub fn add_font_dialog(&mut self) {
+        let files = rfd::FileDialog::new().add_filter("Fonts", &["ttf", "otf"]).pick_files();
+        for f in files.unwrap_or_default() {
+            self.add_font(&f);
         }
     }
 
@@ -221,9 +326,10 @@ impl ForgeApp {
             Ok(()) => {
                 tab.doc.mark_saved();
                 tab.doc.name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Untitled").to_string();
-                tab.doc.path = Some(path);
+                tab.doc.path = Some(path.clone());
                 let _ = std::fs::remove_file(recovery_dir().join(format!("{}.ora", tab.id)));
                 self.tools.status = "Saved".into();
+                self.remember(&path);
                 true
             }
             Err(e) => {
@@ -578,63 +684,80 @@ impl ForgeApp {
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if self.panels.color {
-            egui::CollapsingHeader::new("Color").default_open(true).show(ui, |ui| {
-                panels::color_panel(ui, &mut self.tools, self.editing_bg, &mut self.hex_buf);
-            });
+        let mut action = None;
+        let mut cmd = None;
+        let mut play = None;
+        for g in 0..PANEL_GROUPS.len() {
+            let group = PANEL_GROUPS[g];
+            egui::Frame::none()
+                .fill(Color32::from_rgb(30, 29, 35))
+                .rounding(4.0)
+                .inner_margin(egui::Margin::same(6.0))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    // Tab strip.
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        for (k, p) in group.iter().enumerate() {
+                            let sel = self.panels.tabs[g] == k;
+                            let text = RichText::new(p.name()).size(12.0);
+                            let text = if sel { text.color(ACCENT).strong() } else { text.color(Color32::from_gray(170)) };
+                            if ui.selectable_label(sel, text).clicked() {
+                                self.panels.tabs[g] = k;
+                                self.panels.collapsed[g] = false;
+                            }
+                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let c = self.panels.collapsed[g];
+                            if ui.small_button(if c { "▼" } else { "▲" }).on_hover_text(if c { "Expand" } else { "Collapse" }).clicked() {
+                                self.panels.collapsed[g] = !c;
+                            }
+                        });
+                    });
+                    if self.panels.collapsed[g] {
+                        return;
+                    }
+                    ui.separator();
+                    let id = group[self.panels.tabs[g].min(group.len() - 1)];
+                    match id {
+                        PanelId::Color => panels::color_panel(ui, &mut self.tools, self.editing_bg, &mut self.hex_buf),
+                        PanelId::Swatches => panels::swatches_panel(ui, &mut self.tools, &mut self.swatches),
+                        PanelId::Gradients => panels::gradients_panel(ui, &mut self.tools),
+                        PanelId::Patterns => panels::patterns_panel(ui, &mut self.tools),
+                        PanelId::Brushes => panels::brushes_panel(ui, &mut self.tools, &mut self.brush_presets),
+                        PanelId::Actions => play = panels::actions_panel(ui, &mut self.recorder),
+                        PanelId::Adjustments => cmd = panels::adjustments_panel(ui, !self.tabs.is_empty()),
+                        other => {
+                            let Some(tab) = self.tabs.get_mut(self.active) else {
+                                ui.label(RichText::new("No document open").weak());
+                                return;
+                            };
+                            match other {
+                                PanelId::Properties => panels::properties_panel(ui, tab, &self.fonts),
+                                PanelId::Info => panels::info_panel(ui, tab, &self.tools),
+                                PanelId::Navigator => panels::navigator_panel(ui, tab),
+                                PanelId::Histogram => panels::histogram_panel(ui, tab),
+                                PanelId::Layers => action = panels::layers_panel(ui, tab, &mut self.layers_ui),
+                                PanelId::Channels => cmd = panels::channels_panel(ui, tab),
+                                PanelId::Paths => panels::paths_panel(ui, tab, &self.tools),
+                                PanelId::History => {
+                                    ui.set_max_height(180.0);
+                                    panels::history_panel(ui, tab);
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                });
+            ui.add_space(4.0);
         }
-        if self.panels.swatches {
-            egui::CollapsingHeader::new("Swatches").default_open(true).show(ui, |ui| {
-                panels::swatches_panel(ui, &mut self.tools, &mut self.swatches);
-            });
-        }
-        if self.panels.brushes {
-            egui::CollapsingHeader::new("Brushes").default_open(true).show(ui, |ui| {
-                panels::brushes_panel(ui, &mut self.tools, &mut self.brush_presets);
-            });
-        }
-        if self.panels.actions {
-            let mut play = None;
-            egui::CollapsingHeader::new("Actions").default_open(true).show(ui, |ui| {
-                play = panels::actions_panel(ui, &mut self.recorder);
-            });
-            if let Some(i) = play {
-                if let Some(a) = self.recorder.actions.get(i).cloned() {
-                    crate::actions::play(self, &a, &ctx);
-                }
+        if let Some(i) = play {
+            if let Some(a) = self.recorder.actions.get(i).cloned() {
+                crate::actions::play(self, &a, &ctx);
             }
         }
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        if self.panels.navigator {
-            egui::CollapsingHeader::new("Navigator").default_open(true).show(ui, |ui| panels::navigator_panel(ui, tab));
-        }
-        if self.panels.info {
-            egui::CollapsingHeader::new("Info").default_open(true).show(ui, |ui| panels::info_panel(ui, tab, &self.tools));
-        }
-        if self.panels.histogram {
-            egui::CollapsingHeader::new("Histogram").default_open(true).show(ui, |ui| panels::histogram_panel(ui, tab));
-        }
-        if self.panels.properties {
-            egui::CollapsingHeader::new("Properties").default_open(true).show(ui, |ui| {
-                panels::properties_panel(ui, tab, &self.fonts);
-            });
-        }
-        if self.panels.history {
-            egui::CollapsingHeader::new("History").default_open(true).show(ui, |ui| {
-                ui.set_max_height(140.0);
-                panels::history_panel(ui, tab);
-            });
-        }
-        if self.panels.paths {
-            egui::CollapsingHeader::new("Paths").default_open(true).show(ui, |ui| {
-                panels::paths_panel(ui, tab, &self.tools);
-            });
-        }
-        let mut action = None;
-        if self.panels.layers {
-            egui::CollapsingHeader::new("Layers").default_open(true).show(ui, |ui| {
-                action = panels::layers_panel(ui, tab, &mut self.layers_ui);
-            });
+        if let Some(c) = cmd {
+            self.run(c, &ctx);
         }
         match action {
             Some(LayerAction::Cmd(c)) => self.run(c, &ctx),
@@ -692,28 +815,72 @@ impl ForgeApp {
         });
     }
 
+    /// Start screen: "Projects" with New/Open and recent projects.
     fn welcome(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.3);
+        egui::Frame::none().inner_margin(egui::Margin::same(32.0)).show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.add_space((ui.available_width() - 330.0).max(0.0) / 2.0);
-                ui.label(RichText::new("Forge").size(44.0).strong().color(PAPER));
-                ui.label(RichText::new("Design").size(44.0).strong().color(ACCENT));
+                ui.label(RichText::new("Projects").size(32.0).strong().color(PAPER));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.add_sized([110.0, 32.0], egui::Button::new("Open…")).clicked() {
+                        self.run(Cmd::Open, &ctx);
+                    }
+                    if ui.add_sized([130.0, 32.0], egui::Button::new(RichText::new("+ New Project").strong()).fill(ACCENT_DIM)).clicked() {
+                        self.run(Cmd::New, &ctx);
+                    }
+                });
             });
-            ui.label(RichText::new("Open-source image editing, written in Rust").size(15.0).weak());
-            ui.add_space(20.0);
-            ui.horizontal(|ui| {
-                ui.add_space((ui.available_width() - 260.0).max(0.0) / 2.0);
-                if ui.add_sized([120.0, 34.0], egui::Button::new("New…")).clicked() {
-                    self.run(Cmd::New, &ctx);
-                }
-                if ui.add_sized([120.0, 34.0], egui::Button::new("Open…")).clicked() {
-                    self.run(Cmd::Open, &ctx);
+            ui.add_space(18.0);
+            // Quick-start presets.
+            ui.label(RichText::new("Start a new project").size(15.0).color(Color32::from_gray(200)));
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                for (name, w, h) in [
+                    ("Full HD", 1920, 1080),
+                    ("4K UHD", 3840, 2160),
+                    ("A4 300 ppi", 2480, 3508),
+                    ("Instagram Post", 1080, 1080),
+                    ("Instagram Story", 1080, 1920),
+                    ("YouTube Thumbnail", 1280, 720),
+                    ("Logo / Icon", 1024, 1024),
+                    ("Web Banner", 1840, 860),
+                ] {
+                    let label = RichText::new(format!("{name}\n{w} × {h}")).size(12.0);
+                    if ui.add_sized([128.0, 56.0], egui::Button::new(label)).clicked() {
+                        self.add_tab(Document::new(name, w, h, Some(Color::WHITE)));
+                    }
                 }
             });
-            ui.add_space(12.0);
-            ui.label(RichText::new("…or drop image files here (PNG, JPEG, PSD, ORA, WebP, TIFF, …)").weak());
+            ui.add_space(22.0);
+            ui.label(RichText::new("Recent projects").size(15.0).color(Color32::from_gray(200)));
+            ui.add_space(6.0);
+            if self.recent.is_empty() {
+                ui.label(RichText::new("No recent projects yet. Open or drop images, PSD or ORA files here — you can also drop .ttf/.otf fonts to install them.").weak());
+            }
+            let mut open = None;
+            let mut forget = None;
+            egui::ScrollArea::vertical().max_height(ui.available_height() - 10.0).show(ui, |ui| {
+                for (i, p) in self.recent.iter().enumerate() {
+                    let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("?");
+                    let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        let r = ui.add_sized([360.0, 34.0], egui::Button::new(RichText::new(name).size(14.0)).frame(true));
+                        if r.clicked() {
+                            open = Some(p.clone());
+                        }
+                        ui.label(RichText::new(dir).weak().size(11.0));
+                        if ui.small_button("✖").on_hover_text("Remove from list").clicked() {
+                            forget = Some(i);
+                        }
+                    });
+                }
+            });
+            if let Some(i) = forget {
+                self.recent.remove(i);
+            }
+            if let Some(p) = open {
+                self.open_path(&p);
+            }
         });
     }
 }
@@ -727,6 +894,13 @@ impl eframe::App for ForgeApp {
                 self.open_path(&p);
             } else if let Some(bytes) = f.bytes {
                 let ext = f.name.rsplit('.').next().unwrap_or("").to_string();
+                if matches!(ext.to_ascii_lowercase().as_str(), "ttf" | "otf") {
+                    let tmp = std::env::temp_dir().join(&f.name);
+                    if std::fs::write(&tmp, &bytes).is_ok() {
+                        self.add_font(&tmp);
+                    }
+                    continue;
+                }
                 match forge_io::open_bytes(&bytes, &ext, &f.name) {
                     Ok(d) => self.add_tab(d),
                     Err(e) => self.error(format!("Could not open {}: {e}", f.name)),
@@ -748,6 +922,9 @@ impl eframe::App for ForgeApp {
 
         self.handle_shortcuts(ctx);
         self.autosave();
+        if std::mem::take(&mut self.tools.add_font_request) {
+            self.add_font_dialog();
+        }
 
         // Text tool clicked: open the type dialog (new or re-edit).
         if let Some((p, hit)) = self.tools.text_request.take() {
@@ -790,7 +967,7 @@ impl eframe::App for ForgeApp {
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
         if !self.hide_panels {
-            egui::SidePanel::left("tools").resizable(false).exact_width(84.0).show(ctx, |ui| {
+            egui::SidePanel::left("tools").resizable(false).exact_width(48.0).show(ctx, |ui| {
                 ui.add_space(4.0);
                 egui::ScrollArea::vertical().show(ui, |ui| panels::toolbar(ui, &mut self.tools, &mut self.editing_bg));
             });

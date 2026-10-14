@@ -12,10 +12,63 @@ pub struct FontEntry {
     pub path: Option<PathBuf>,
 }
 
-/// Bundled font (from egui) plus `.ttf`/`.otf` files found in the usual
-/// system font directories.
+/// Folder where users install their own fonts (Add Font / drag & drop).
+pub fn user_font_dir() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+    Some(base.join("forge-design").join("fonts"))
+}
+
+/// Fonts shipped with the app: `<exe dir>/fonts`, or `assets/fonts` in a
+/// source checkout.
+fn bundled_font_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            v.push(dir.join("fonts"));
+            v.push(dir.join("../share/forge-design/fonts"));
+        }
+    }
+    v.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/fonts"));
+    v
+}
+
+/// Turns a file stem like `OpenSans-BoldItalic` into `Open Sans Bold Italic`.
+pub fn pretty_name(stem: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = stem.replace(['-', '_'], " ").chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = if i > 0 { chars[i - 1] } else { ' ' };
+        let next = chars.get(i + 1).copied().unwrap_or(' ');
+        if i > 0 && c.is_uppercase() && prev != ' ' && (prev.is_lowercase() || next.is_lowercase()) && !prev.is_uppercase() {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    let mut s = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some(f) = s.get_mut(0..1) {
+        f.make_ascii_uppercase();
+    }
+    s
+}
+
+/// Built-in font, the 150 bundled fonts, user-installed fonts and system fonts.
 pub fn discover_fonts() -> Vec<FontEntry> {
     let mut out = vec![FontEntry { name: "Ubuntu Light (built-in)".into(), path: None }];
+    let mut bundled = Vec::new();
+    for d in bundled_font_dirs() {
+        walk(&d, 0, &mut bundled);
+        if !bundled.is_empty() {
+            break;
+        }
+    }
+    let mut user = Vec::new();
+    if let Some(d) = user_font_dir() {
+        walk(&d, 0, &mut user);
+    }
+    let mut system = Vec::new();
     let mut dirs: Vec<PathBuf> = vec![
         "/usr/share/fonts".into(),
         "/usr/local/share/fonts".into(),
@@ -26,17 +79,41 @@ pub fn discover_fonts() -> Vec<FontEntry> {
     if let Some(home) = std::env::var_os("HOME") {
         let home = PathBuf::from(home);
         dirs.push(home.join(".fonts"));
-        dirs.push(home.join(".local/share/fonts"));
         dirs.push(home.join("Library/Fonts"));
     }
-    let mut found = Vec::new();
-    for d in dirs {
-        walk(&d, 0, &mut found);
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        dirs.push(PathBuf::from(local).join("Microsoft\\Windows\\Fonts"));
     }
-    found.sort_by_key(|a| a.name.to_lowercase());
-    found.dedup_by(|a, b| a.name == b.name);
-    out.extend(found);
+    for d in dirs {
+        walk(&d, 0, &mut system);
+    }
+    for list in [&mut user, &mut bundled, &mut system] {
+        list.sort_by_key(|a| a.name.to_lowercase());
+    }
+    // User fonts first, then bundled, then system; drop duplicates by name.
+    for f in user.into_iter().chain(bundled).chain(system) {
+        if !out.iter().any(|o| o.name == f.name) {
+            out.push(f);
+        }
+    }
     out
+}
+
+/// Copies a font file into the user font folder (Add Font / drag & drop).
+pub fn install_font(src: &std::path::Path) -> Result<FontEntry, String> {
+    let bytes = std::fs::read(src).map_err(|e| e.to_string())?;
+    FontVec::try_from_vec(bytes.clone()).map_err(|_| "Not a valid TrueType/OpenType font".to_string())?;
+    let dir = user_font_dir().ok_or("No font folder")?;
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let name = src.file_name().ok_or("Bad file name")?;
+    let dst = dir.join(name);
+    std::fs::write(&dst, bytes).map_err(|e| e.to_string())?;
+    let stem = dst.file_stem().and_then(|s| s.to_str()).unwrap_or("Font");
+    Ok(FontEntry { name: pretty_name(stem), path: Some(dst) })
+}
+
+pub fn is_font_file(p: &std::path::Path) -> bool {
+    matches!(p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(), Some("ttf" | "otf"))
 }
 
 fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<FontEntry>) {
@@ -52,7 +129,7 @@ fn walk(dir: &std::path::Path, depth: u32, out: &mut Vec<FontEntry>) {
             p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
             Some("ttf" | "otf")
         ) {
-            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("?").to_string();
+            let name = pretty_name(p.file_stem().and_then(|s| s.to_str()).unwrap_or("?"));
             out.push(FontEntry { name, path: Some(p) });
         }
     }

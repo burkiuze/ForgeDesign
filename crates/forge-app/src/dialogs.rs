@@ -1009,6 +1009,9 @@ impl TextDialog {
                 }
                 ui.add(egui::DragValue::new(&mut d.size).range(4.0..=1000.0).suffix(" px"));
                 color_button(ui, "", &mut d.color);
+                if ui.button("+ Font").on_hover_text("Add a .ttf/.otf font").clicked() {
+                    tools.add_font_request = true;
+                }
             });
             ui.horizontal(|ui| {
                 ui.toggle_value(&mut d.bold, egui::RichText::new("B").strong()).on_hover_text("Faux Bold");
@@ -1755,20 +1758,24 @@ fn rayon_threads() -> usize {
 pub fn shortcuts(ctx: &egui::Context) -> Outcome {
     let mut out = Outcome::Open;
     let rows = [
-        ("Tools", "V Move · M Marquee · L Lasso · W Magic Wand · C Crop · I Eyedropper"),
-        ("", "B Brush · N Pencil · S Clone Stamp · E Eraser · G Gradient · K Bucket"),
-        ("", "T Type · U Shape · H Hand · Z Zoom · Shift+M toggles marquee shape"),
-        ("Brush", "[ / ] size · Shift+[ / ] hardness · 1–0 opacity"),
-        ("Colours", "X swap · D default · Alt+click eyedropper while painting"),
-        ("View", "Ctrl + / Ctrl − zoom · Ctrl+0 fit · Ctrl+1 100% · Space+drag pan · Alt+wheel zoom"),
-        ("Edit", "Ctrl+Z undo · Ctrl+Shift+Z / Ctrl+Y redo · Ctrl+T transform"),
-        ("", "Ctrl+X/C/V cut/copy/paste · Ctrl+Shift+C copy merged · Del clear"),
-        ("", "Alt+Backspace fill FG · Ctrl+Backspace fill BG"),
-        ("Select", "Ctrl+A all · Ctrl+D deselect · Ctrl+Shift+I inverse · Shift/Alt modify"),
-        ("Layer", "Ctrl+Shift+N new · Ctrl+J duplicate/via copy · Ctrl+E merge · Ctrl+[ ] arrange"),
-        ("Image", "Ctrl+L levels · Ctrl+M curves · Ctrl+U hue/sat · Ctrl+I invert · Ctrl+B balance"),
-        ("", "Ctrl+Alt+I image size · Ctrl+Alt+C canvas size · Ctrl+F repeat filter"),
-        ("File", "Ctrl+N new · Ctrl+O open · Ctrl+S save · Ctrl+Shift+S save as · Ctrl+Shift+E export"),
+        ("Tools", "V Move · M Marquee · L Lasso · W Quick Selection/Magic Wand · C Crop · I Eyedropper/Ruler"),
+        ("", "J Healing · B Brush · S Stamp · E Eraser · G Gradient/Bucket · O Dodge/Burn/Sponge"),
+        ("", "P Pen · T Type · A Path Selection · U Shape · H Hand · Z Zoom · Shift+key cycles a group"),
+        ("Brush", "[ / ] size · Shift+[ / ] hardness · 1–0 opacity · Alt+click eyedropper"),
+        ("Colours", "X swap · D default · Q Quick Mask · Alt+Backspace fill FG · Ctrl+Backspace fill BG"),
+        ("View", "Ctrl+ + / − zoom · Ctrl+0 fit · Ctrl+1 / Alt+Ctrl+0 100% · Space drag · Tab panels · F screen"),
+        ("", "Ctrl+R rulers · Ctrl+' grid · Ctrl+; guides · Shift+Ctrl+; snap · Ctrl+H extras · Ctrl+Y proof"),
+        ("Edit", "Ctrl+Z undo · Shift+Ctrl+Z redo · Ctrl+T free transform · Shift+F5 fill · F12 revert"),
+        ("", "Ctrl+X/C/V · Shift+Ctrl+C copy merged · Shift+Ctrl+V paste in place · Del clear"),
+        ("Select", "Ctrl+A · Ctrl+D · Shift+Ctrl+D reselect · Shift+Ctrl+I inverse · Shift+F6 feather · Alt+Ctrl+R"),
+        ("Layer", "Shift+Ctrl+N new · Ctrl+J via copy · Shift+Ctrl+J via cut · Ctrl+G group · Shift+Ctrl+G ungroup"),
+        ("", "Ctrl+E merge down · Shift+Ctrl+E merge visible · Alt+Shift+Ctrl+E stamp · Alt+Ctrl+G clip"),
+        ("", "Ctrl+[ ] arrange · Shift+Ctrl+[ ] front/back · Alt+[ ] select below/above"),
+        ("Image", "Ctrl+L levels · Ctrl+M curves · Ctrl+U hue/sat · Ctrl+B balance · Ctrl+I invert"),
+        ("", "Shift+Ctrl+U desaturate · Alt+Shift+Ctrl+B B&W · Shift+Ctrl+L auto tone · Shift+Ctrl+B auto color"),
+        ("", "Alt+Ctrl+I image size · Alt+Ctrl+C canvas size · Shift+Ctrl+X liquify · Ctrl+F / Alt+Ctrl+F last filter"),
+        ("File", "Ctrl+N · Ctrl+O · Ctrl+S · Shift+Ctrl+S · Alt+Shift+Ctrl+W export as · Ctrl+W · Alt+Ctrl+W close all"),
+        ("Panels", "F5 Brushes · F6 Color · F7 Layers · F8 Info · Alt+F9 Actions · Alt+Shift+Ctrl+K this list"),
     ];
     window("Keyboard Shortcuts").show(ctx, |ui| {
         egui::Grid::new("keys").striped(true).show(ui, |ui| {

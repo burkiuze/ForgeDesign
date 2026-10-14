@@ -159,7 +159,6 @@ impl Tool {
             8 => S,
             9 => E,
             10 => G,
-            11 => R,
             12 => O,
             14 => P,
             15 => T,
@@ -349,6 +348,8 @@ pub struct ToolState {
     /// Set by the Text tool on click; the app opens the text dialog.
     pub text_request: Option<(Point, Option<usize>)>,
     pub status: String,
+    /// "+ Add Font" clicked in the options bar / Type dialog.
+    pub add_font_request: bool,
 }
 
 fn default_pattern() -> TiledBuffer<Rgba8> {
@@ -446,6 +447,7 @@ impl Default for ToolState {
             path_stroke_width: 3.0,
             text_request: None,
             status: String::new(),
+            add_font_request: false,
         }
     }
 }
@@ -1809,7 +1811,10 @@ impl ToolState {
                     for (a, l) in [(TextAlign::Left, "⬅"), (TextAlign::Center, "↔"), (TextAlign::Right, "➡")] {
                         ui.selectable_value(&mut self.text.align, a, l);
                     }
-                    ui.label("Click to add text, click a type layer to edit it");
+                    if ui.button("+ Add Font…").on_hover_text("Install a .ttf/.otf font (you can also drag & drop fonts onto the window)").clicked() {
+                        self.add_font_request = true;
+                    }
+                    ui.label(format!("{} fonts · click to add text, click a type layer to edit it", fonts.len()));
                 }
                 Tool::Crop => {
                     let ratios: [(&str, Option<(f32, f32)>); 7] = [

@@ -1,0 +1,10 @@
+Forge Design 0.1.1 — Windows Kurulumu
+=====================================
+1. ForgeDesign-0.1.1-Setup.exe dosyasını çalıştırın.
+2. Sihirbaz: Türkçe/English dil, lisans, bileşenler (masaüstü kısayolu,
+   .ora/.psd ilişkilendirme), kurulum klasörü.
+3. Bitince "Forge Design'ı başlat" ile açılır. 150 yerleşik font kurulur.
+
+Not: Kurulum imzalı değil; SmartScreen uyarırsa "Ek bilgi" -> "Yine de çalıştır".
+Kaldırma: Ayarlar > Uygulamalar > Forge Design > Kaldır.
+Gereksinim: Windows 10/11 64-bit, OpenGL 2.0+ ekran sürücüsü.
