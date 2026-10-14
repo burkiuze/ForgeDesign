@@ -39,8 +39,12 @@ fn checker(x: i32, y: i32) -> f32 {
 }
 
 /// One thing to blend: a layer, a rendered group, or a layer-style effect.
+type AdjustFn = dyn Fn(Rgba8) -> Rgba8 + Send + Sync;
+
 struct Item<'a> {
     pixels: &'a TiledBuffer<Rgba8>,
+    /// Adjustment layers recolour everything below instead of adding pixels.
+    adjust: Option<&'a AdjustFn>,
     mask: Option<&'a LayerMask>,
     opacity: f32,
     mode: BlendMode,
@@ -54,7 +58,10 @@ struct Item<'a> {
 enum Owned {
     Buffer(TiledBuffer<Rgba8>),
     Style(Arc<RenderedStyle>),
+    Adjust(Box<AdjustFn>),
 }
+
+static EMPTY: std::sync::LazyLock<TiledBuffer<Rgba8>> = std::sync::LazyLock::new(|| TiledBuffer::new(1, 1));
 
 fn is_top_level(l: &Layer, layers: &[&Layer], parent: Option<LayerId>) -> bool {
     match parent {
@@ -94,6 +101,9 @@ fn composite_level(layers: &[&Layer], parent: Option<LayerId>, w: u32, h: u32, r
         if let Some(st) = crate::styles::rendered(l) {
             owned.push((i, Owned::Style(st)));
         }
+        if let Some(adj) = l.adjustment.as_ref().filter(|_| l.is_adjustment()) {
+            owned.push((i, Owned::Adjust(adj.compile())));
+        }
     }
     let mut items: Vec<Item> = Vec::new();
     for (i, l) in level.iter().enumerate() {
@@ -103,8 +113,26 @@ fn composite_level(layers: &[&Layer], parent: Option<LayerId>, w: u32, h: u32, r
         });
         if let Some(st) = style {
             for e in &st.below {
-                items.push(Item { pixels: &e.pixels, mask: None, opacity: e.opacity * l.opacity, mode: e.mode, clipped: false, effect: true });
+                items.push(Item { pixels: &e.pixels, adjust: None, mask: None, opacity: e.opacity * l.opacity, mode: e.mode, clipped: false, effect: true });
             }
+        }
+        if l.is_adjustment() {
+            let f = owned.iter().find_map(|(j, o)| match o {
+                Owned::Adjust(f) if *j == i => Some(f.as_ref()),
+                _ => None,
+            });
+            if let Some(f) = f {
+                items.push(Item {
+                    pixels: &EMPTY,
+                    adjust: Some(f),
+                    mask: l.active_mask(),
+                    opacity: l.opacity,
+                    mode: l.blend,
+                    clipped: l.clipped,
+                    effect: true,
+                });
+            }
+            continue;
         }
         let pixels = if l.is_group() {
             owned.iter().find_map(|(j, o)| match o {
@@ -117,6 +145,7 @@ fn composite_level(layers: &[&Layer], parent: Option<LayerId>, w: u32, h: u32, r
         if let Some(pixels) = pixels {
             items.push(Item {
                 pixels,
+                adjust: None,
                 mask: l.active_mask(),
                 opacity: l.opacity * l.fill,
                 mode: l.blend,
@@ -126,7 +155,7 @@ fn composite_level(layers: &[&Layer], parent: Option<LayerId>, w: u32, h: u32, r
         }
         if let Some(st) = style {
             for e in &st.above {
-                items.push(Item { pixels: &e.pixels, mask: None, opacity: e.opacity * l.opacity, mode: e.mode, clipped: l.clipped, effect: true });
+                items.push(Item { pixels: &e.pixels, adjust: None, mask: None, opacity: e.opacity * l.opacity, mode: e.mode, clipped: l.clipped, effect: true });
             }
         }
     }
@@ -174,6 +203,34 @@ fn composite_items(items: &[Item], rect: IRect, bg: Background) -> Vec<Rgba8> {
             let base_y = (ty * TILE_SIZE) as i32;
 
             for item in items {
+                if let Some(f) = item.adjust {
+                    let mask_tile = item.mask.and_then(|m| m.tile(tx, ty));
+                    let mask_fill = item.mask.map_or(255, |m| m.fill_value());
+                    for ly in 0..band_h {
+                        let py = band_y0 + ly as i32;
+                        let trow = ((py - base_y) as u32 * TILE_SIZE) as usize;
+                        for lx in 0..tw {
+                            let ti = trow + (x + lx as i32 - base_x) as usize;
+                            let ai = ly * tw + lx;
+                            let m = mask_tile.map_or(mask_fill, |mt| mt[ti]);
+                            let mut a = lut[m as usize] * item.opacity;
+                            if item.clipped {
+                                a *= clip[ai];
+                            }
+                            let c = &mut acc[ai];
+                            if a <= 0.0 || c[3] <= 0.0 {
+                                continue;
+                            }
+                            let inv = 1.0 / c[3];
+                            let o = f([q(c[0] * inv), q(c[1] * inv), q(c[2] * inv), 255]);
+                            for k in 0..3 {
+                                let target = lut[o[k] as usize] * c[3];
+                                c[k] += (target - c[k]) * a;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 let tile = item.pixels.tile(tx, ty);
                 let is_base = any_clip && !item.clipped && !item.effect;
                 if tile.is_none() {
@@ -331,6 +388,17 @@ mod tests {
         g.visible = false;
         let out = composite_layers(&[&bg, &child, &g], 10, 10, IRect::from_size(10, 10), Background::Transparent);
         assert_eq!(out[0], [255, 255, 255, 255], "hidden group hides children");
+    }
+
+    #[test]
+    fn adjustment_layer() {
+        let mut bg = Layer::new(1, "bg", 10, 10);
+        bg.pixels = TiledBuffer::solid(10, 10, [200, 100, 50, 255]);
+        let mut adj = Layer::new_adjustment(2, crate::adjust::Adjustment::Invert, 10, 10);
+        adj.mask.as_mut().unwrap().set(1, 0, 0);
+        let out = composite_layers(&[&bg, &adj], 10, 10, IRect::new(0, 0, 2, 1), Background::Transparent);
+        assert_eq!(out[0], [55, 155, 205, 255]);
+        assert_eq!(out[1], [200, 100, 50, 255], "masked out");
     }
 
     #[test]

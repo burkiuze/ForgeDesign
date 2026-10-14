@@ -15,4 +15,6 @@ forge-core = { path = "../forge-core" }
 forge-io = { path = "../forge-io" }
 eframe = "0.29"
 ab_glyph = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal", "pollster", "wayland"] }

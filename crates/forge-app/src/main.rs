@@ -1,9 +1,12 @@
 //! Forge Design — open-source raster image editor.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(clippy::too_many_arguments, clippy::type_complexity, clippy::large_enum_variant, clippy::needless_range_loop)]
 
+mod actions;
 mod app;
 mod canvas;
+mod commands;
 mod dialogs;
 mod icons;
 mod panels;

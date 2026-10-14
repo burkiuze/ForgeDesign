@@ -88,12 +88,18 @@ pub fn ellipse_mask(w: u32, h: u32, r: IRect) -> Mask {
 /// Antialiased polygon fill (even-odd rule) with 4 sub-scanlines per pixel
 /// and exact horizontal coverage. Used by the lasso and shape tools.
 pub fn polygon_mask(w: u32, h: u32, pts: &[Point]) -> Mask {
+    polygon_mask_multi(w, h, std::slice::from_ref(&pts.to_vec()))
+}
+
+/// Even-odd fill of several rings at once (paths with holes).
+pub fn polygon_mask_multi(w: u32, h: u32, rings: &[Vec<Point>]) -> Mask {
     let mut m = Mask::new(w, h);
-    if pts.len() < 3 {
+    let rings: Vec<&Vec<Point>> = rings.iter().filter(|r| r.len() >= 3).collect();
+    if rings.is_empty() {
         return m;
     }
     let (mut minx, mut miny, mut maxx, mut maxy) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
-    for p in pts {
+    for p in rings.iter().flat_map(|r| r.iter()) {
         minx = minx.min(p.x);
         miny = miny.min(p.y);
         maxx = maxx.max(p.x);
@@ -116,11 +122,13 @@ pub fn polygon_mask(w: u32, h: u32, pts: &[Point]) -> Mask {
             for s in 0..SUB {
                 let sy = y as f32 + (s as f32 + 0.5) / SUB as f32;
                 xs.clear();
-                for i in 0..pts.len() {
-                    let a = pts[i];
-                    let b = pts[(i + 1) % pts.len()];
-                    if (a.y <= sy && b.y > sy) || (b.y <= sy && a.y > sy) {
-                        xs.push(a.x + (sy - a.y) / (b.y - a.y) * (b.x - a.x));
+                for pts in &rings {
+                    for i in 0..pts.len() {
+                        let a = pts[i];
+                        let b = pts[(i + 1) % pts.len()];
+                        if (a.y <= sy && b.y > sy) || (b.y <= sy && a.y > sy) {
+                            xs.push(a.x + (sy - a.y) / (b.y - a.y) * (b.x - a.x));
+                        }
                     }
                 }
                 xs.sort_by(f32::total_cmp);

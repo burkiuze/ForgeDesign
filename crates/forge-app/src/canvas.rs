@@ -15,14 +15,23 @@ use crate::tools::{Interaction, Tool, ToolState};
 const CHUNK: u32 = 1024;
 
 pub struct DocTab {
+    /// Unique per session (recovery file names).
+    pub id: u64,
     pub doc: Document,
     pub view: View,
     pub pending_crop: Option<IRect>,
+    /// For Select > Reselect.
+    pub last_selection: Option<forge_core::selection::Mask>,
+    /// Saved selections (alpha channels).
+    pub channels: Vec<(String, forge_core::selection::Mask)>,
 }
+
+static NEXT_TAB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl DocTab {
     pub fn new(doc: Document) -> Self {
-        Self { doc, view: View::default(), pending_crop: None }
+        let id = NEXT_TAB.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + std::process::id() as u64 * 1000;
+        Self { id, doc, view: View::default(), pending_crop: None, last_selection: None, channels: Vec::new() }
     }
 
     pub fn title(&self) -> String {
@@ -45,6 +54,67 @@ pub struct View {
     space_pan: bool,
     /// Cached histogram of the active layer, keyed by (history serial, layer).
     pub hist: Option<((u64, usize), Box<[[u32; 256]; 4]>)>,
+    pub show_rulers: bool,
+    pub show_grid: bool,
+    pub grid_size: f32,
+    pub show_guides: bool,
+    pub snap: bool,
+    /// (vertical, position in image px)
+    pub guides: Vec<(bool, f32)>,
+    dragging_guide: Option<usize>,
+    pub proof: Proof,
+    proof_applied: Proof,
+}
+
+/// View > Proof Colors.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Proof {
+    #[default]
+    Off,
+    /// Approximate CMYK print gamut (out-of-gamut colours are desaturated).
+    Cmyk,
+    Grayscale,
+    /// Protanopia-like colour-blindness simulation.
+    ColorBlind,
+}
+
+impl Proof {
+    pub const ALL: [Proof; 4] = [Proof::Off, Proof::Cmyk, Proof::Grayscale, Proof::ColorBlind];
+    pub fn name(self) -> &'static str {
+        match self {
+            Proof::Off => "Off",
+            Proof::Cmyk => "Working CMYK",
+            Proof::Grayscale => "Grayscale",
+            Proof::ColorBlind => "Color Blindness (Protanopia)",
+        }
+    }
+
+    fn apply(self, p: [u8; 4]) -> [u8; 4] {
+        let c = [p[0] as f32 / 255.0, p[1] as f32 / 255.0, p[2] as f32 / 255.0];
+        let q = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+        match self {
+            Proof::Off => p,
+            Proof::Grayscale => {
+                let l = forge_core::color::lum(c);
+                [q(l), q(l), q(l), p[3]]
+            }
+            Proof::Cmyk => {
+                // Compress saturation of very saturated colours and lift deep
+                // blacks a little, roughly like an uncoated print gamut.
+                let [h, s, l] = forge_core::color::rgb_to_hsl(c);
+                let s2 = if s > 0.75 { 0.75 + (s - 0.75) * 0.35 } else { s };
+                let l2 = 0.04 + l * 0.94;
+                let o = forge_core::color::hsl_to_rgb([h, s2, l2]);
+                [q(o[0]), q(o[1]), q(o[2]), p[3]]
+            }
+            Proof::ColorBlind => {
+                let r = 0.567 * c[0] + 0.433 * c[1];
+                let g = 0.558 * c[0] + 0.442 * c[1];
+                let b = 0.242 * c[1] + 0.758 * c[2];
+                [q(r), q(g), q(b), p[3]]
+            }
+        }
+    }
 }
 
 impl Default for View {
@@ -61,6 +131,15 @@ impl Default for View {
             hover: None,
             space_pan: false,
             hist: None,
+            show_rulers: true,
+            show_grid: false,
+            grid_size: 32.0,
+            show_guides: true,
+            snap: true,
+            guides: Vec::new(),
+            dragging_guide: None,
+            proof: Proof::Off,
+            proof_applied: Proof::Off,
         }
     }
 }
@@ -73,6 +152,38 @@ const ZOOM_STEPS: [f32; 25] = [
 impl View {
     pub fn request_fit(&mut self) {
         self.fit_requested = true;
+    }
+
+    /// Snaps an image-space point to guides, grid and the canvas edges
+    /// when within 6 screen pixels.
+    pub fn snap_point(&self, p: Point, w: u32, h: u32) -> Point {
+        if !self.snap {
+            return p;
+        }
+        let tol = 6.0 / self.zoom.max(0.01);
+        let mut xs: Vec<f32> = vec![0.0, w as f32, w as f32 * 0.5];
+        let mut ys: Vec<f32> = vec![0.0, h as f32, h as f32 * 0.5];
+        if self.show_guides {
+            for &(vertical, pos) in &self.guides {
+                if vertical {
+                    xs.push(pos);
+                } else {
+                    ys.push(pos);
+                }
+            }
+        }
+        let mut out = p;
+        if self.show_grid && self.grid_size > 1.0 {
+            xs.push((p.x / self.grid_size).round() * self.grid_size);
+            ys.push((p.y / self.grid_size).round() * self.grid_size);
+        }
+        if let Some(x) = xs.into_iter().filter(|x| (x - p.x).abs() < tol).min_by(|a, b| (a - p.x).abs().total_cmp(&(b - p.x).abs())) {
+            out.x = x;
+        }
+        if let Some(y) = ys.into_iter().filter(|y| (y - p.y).abs() < tol).min_by(|a, b| (a - p.y).abs().total_cmp(&(b - p.y).abs())) {
+            out.y = y;
+        }
+        out
     }
 
     fn origin(&self, canvas: Rect, w: u32, h: u32) -> Pos2 {
@@ -126,6 +237,10 @@ impl View {
             self.chunks.resize_with(n, || None);
             doc.mark_all_dirty();
         }
+        if self.proof != self.proof_applied {
+            self.proof_applied = self.proof;
+            doc.mark_all_dirty();
+        }
         if doc.take_selection_changed() {
             self.outline = doc.selection().map(selection::outline).unwrap_or_default();
         }
@@ -164,7 +279,7 @@ impl View {
                 for y in sub.y0..sub.y1 {
                     let row = (y - region.y0) as usize * rw;
                     for x in sub.x0..sub.x1 {
-                        let p = px[row + (x - region.x0) as usize];
+                        let p = self.proof.apply(px[row + (x - region.x0) as usize]);
                         pixels.push(Color32::from_rgb(p[0], p[1], p[2]));
                     }
                 }
@@ -182,16 +297,20 @@ fn chunk_rect(cx: u32, cy: u32, w: u32, h: u32) -> IRect {
     IRect::new((cx * CHUNK) as i32, (cy * CHUNK) as i32, ((cx + 1) * CHUNK) as i32, ((cy + 1) * CHUNK) as i32).clamp_to(w, h)
 }
 
+const RULER: f32 = 18.0;
+
 /// Draws the canvas and routes pointer input to the active tool.
 pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, interactive: bool) {
-    let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
+    let (full_rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     let ctx = ui.ctx().clone();
+    let rect = full_rect;
     tab.view.canvas_rect = rect;
     let (w, h) = (tab.doc.width(), tab.doc.height());
     if tab.view.fit_requested && rect.width() > 50.0 {
         tab.view.fit(w, h);
         tab.view.fit_requested = false;
     }
+    tools.update_transform_preview(tab);
     tab.view.sync_textures(&ctx, &mut tab.doc);
 
     let painter = ui.painter_at(rect);
@@ -216,6 +335,48 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
         }
     }
 
+    // Guides: drag out of the rulers, or move existing ones with the Move tool.
+    let in_top_ruler = |p: Pos2| tab.view.show_rulers && p.y < rect.top() + RULER && p.x > rect.left() + RULER;
+    let in_left_ruler = |p: Pos2| tab.view.show_rulers && p.x < rect.left() + RULER && p.y > rect.top() + RULER;
+    let mut guide_input = false;
+    if interactive {
+        if let Some(pos) = pointer.interact_pos() {
+            if pointer.primary_pressed() && response.hovered() {
+                if in_top_ruler(pos) {
+                    tab.view.guides.push((false, tab.view.to_image(rect, w, h, pos).y));
+                    tab.view.dragging_guide = Some(tab.view.guides.len() - 1);
+                    tab.view.show_guides = true;
+                } else if in_left_ruler(pos) {
+                    tab.view.guides.push((true, tab.view.to_image(rect, w, h, pos).x));
+                    tab.view.dragging_guide = Some(tab.view.guides.len() - 1);
+                    tab.view.show_guides = true;
+                } else if tools.tool == Tool::Move && tab.view.show_guides && tools.transform.is_none() {
+                    let ip = tab.view.to_image(rect, w, h, pos);
+                    let tol = 4.0 / tab.view.zoom;
+                    tab.view.dragging_guide = tab
+                        .view
+                        .guides
+                        .iter()
+                        .position(|&(v, g)| if v { (ip.x - g).abs() < tol } else { (ip.y - g).abs() < tol });
+                }
+            }
+            if let Some(gi) = tab.view.dragging_guide {
+                guide_input = true;
+                let ip = tab.view.to_image(rect, w, h, pos);
+                if let Some(g) = tab.view.guides.get_mut(gi) {
+                    g.1 = if g.0 { ip.x.round() } else { ip.y.round() };
+                }
+                if !pointer.primary_down() {
+                    // Dropping a guide back on the ruler deletes it.
+                    if in_top_ruler(pos) || in_left_ruler(pos) || !rect.contains(pos) {
+                        tab.view.guides.remove(gi);
+                    }
+                    tab.view.dragging_guide = None;
+                }
+            }
+        }
+    }
+
     // Panning: middle mouse, Space+drag, or the Hand tool.
     let panning_tool = tools.tool == Tool::Hand || space;
     if response.dragged_by(egui::PointerButton::Middle)
@@ -227,15 +388,18 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
         tab.view.space_pan = false;
     }
 
-    if interactive && !panning_tool && !tab.view.space_pan {
+    if interactive && !guide_input && !panning_tool && !tab.view.space_pan {
+        let snapping = tools.tool.snaps() || tools.transform.is_some();
+        let snap = move |tab: &DocTab, p: Point| if snapping { tab.view.snap_point(p, w, h) } else { p };
         if let Some(pos) = pointer.interact_pos() {
-            let ip = tab.view.to_image(rect, w, h, pos);
+            let ip = snap(tab, tab.view.to_image(rect, w, h, pos));
             if pointer.primary_pressed() && response.hovered() {
+                let double = pointer.button_double_clicked(egui::PointerButton::Primary);
                 match tools.tool {
-                    Tool::Zoom => tab.view.zoom_step(if mods.alt { -1 } else { 1 }, Some(pos), w, h),
-                    _ => tools.pointer_down(tab, ip, mods),
+                    Tool::Zoom if tools.transform.is_none() => tab.view.zoom_step(if mods.alt { -1 } else { 1 }, Some(pos), w, h),
+                    _ => tools.pointer_down(tab, ip, mods, double),
                 }
-            } else if tools.is_busy() && pointer.primary_down() {
+            } else if tools.is_busy() || (tools.tool == Tool::PolygonLasso && pointer.is_moving()) {
                 // Use all intermediate pointer events for smooth strokes.
                 let moves: Vec<Pos2> = ctx.input(|i| {
                     i.events
@@ -246,12 +410,14 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
                         })
                         .collect()
                 });
-                if moves.is_empty() {
-                    tools.pointer_move(tab, ip, mods);
-                }
-                for m in moves {
-                    let p = tab.view.to_image(rect, w, h, m);
-                    tools.pointer_move(tab, p, mods);
+                if pointer.primary_down() || tools.tool == Tool::PolygonLasso {
+                    if moves.is_empty() {
+                        tools.pointer_move(tab, ip, mods);
+                    }
+                    for m in moves {
+                        let p = snap(tab, tab.view.to_image(rect, w, h, m));
+                        tools.pointer_move(tab, p, mods);
+                    }
                 }
             }
         }
@@ -260,6 +426,7 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
         }
     }
     // Re-sync after edits made this frame so the result shows immediately.
+    tools.update_transform_preview(tab);
     tab.view.sync_textures(&ctx, &mut tab.doc);
 
     // ---------------------------------------------------------- drawing
@@ -279,34 +446,43 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
         }
     }
     painter.rect_stroke(img_rect, 0.0, EStroke::new(1.0_f32, Color32::from_gray(20)));
+    let s = |p: Point| view.to_screen(rect, w, h, p);
 
-    // Pixel grid at high zoom.
+    // Pixel grid at high zoom, user grid, guides.
+    let vis = img_rect.intersect(rect);
     if view.zoom >= 12.0 {
-        let vis = img_rect.intersect(rect);
-        let a = view.to_image(rect, w, h, vis.min);
-        let b = view.to_image(rect, w, h, vis.max);
-        let grid = EStroke::new(1.0_f32, Color32::from_white_alpha(25));
-        for x in a.x.floor().max(0.0) as i32..=b.x.ceil().min(w as f32) as i32 {
-            let sx = view.to_screen(rect, w, h, Point::new(x as f32, 0.0)).x;
-            painter.line_segment([Pos2::new(sx, vis.min.y), Pos2::new(sx, vis.max.y)], grid);
-        }
-        for y in a.y.floor().max(0.0) as i32..=b.y.ceil().min(h as f32) as i32 {
-            let sy = view.to_screen(rect, w, h, Point::new(0.0, y as f32)).y;
-            painter.line_segment([Pos2::new(vis.min.x, sy), Pos2::new(vis.max.x, sy)], grid);
+        draw_grid(&painter, view, rect, w, h, vis, 1.0, Color32::from_white_alpha(25));
+    }
+    if view.show_grid && view.grid_size * view.zoom >= 6.0 {
+        draw_grid(&painter, view, rect, w, h, vis, view.grid_size, Color32::from_rgba_unmultiplied(120, 160, 255, 60));
+    }
+    if view.show_guides {
+        let gs = EStroke::new(1.0_f32, Color32::from_rgb(0, 220, 220));
+        for &(vertical, pos) in &view.guides {
+            if vertical {
+                let x = s(Point::new(pos, 0.0)).x;
+                painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], gs);
+            } else {
+                let y = s(Point::new(0.0, pos)).y;
+                painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], gs);
+            }
         }
     }
 
-    let s = |p: Point| view.to_screen(rect, w, h, p);
     let time = ctx.input(|i| i.time);
 
-    // Marching ants.
+    // Marching ants (offset while patching).
     if !view.outline.is_empty() {
+        let shift = match &tools.interaction {
+            Interaction::Patch { start, current } => Vec2::new(current.x - start.x, current.y - start.y) * view.zoom,
+            _ => Vec2::ZERO,
+        };
         let offset = (time * 8.0) as f32 % 8.0;
         let black = EStroke::new(1.0_f32, Color32::BLACK);
         let white = EStroke::new(1.0_f32, Color32::WHITE);
         let too_many = view.outline.len() > 30_000;
         for &(a, b) in &view.outline {
-            let (pa, pb) = (s(a), s(b));
+            let (pa, pb) = (s(a) + shift, s(b) + shift);
             if !rect.intersects(Rect::from_two_pos(pa, pb).expand(1.0)) {
                 continue;
             }
@@ -318,23 +494,55 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
         ctx.request_repaint_after(std::time::Duration::from_millis(80));
     }
 
-    // Interaction previews.
+    // Vector paths.
     let accent = EStroke::new(1.0_f32, crate::app::ACCENT);
+    for (pi, path) in tab.doc.state.paths.iter().enumerate() {
+        let active = tab.doc.state.active_path == Some(pi);
+        let stroke = if active { EStroke::new(1.5_f32, Color32::from_rgb(40, 140, 255)) } else { EStroke::new(1.0_f32, Color32::from_rgba_unmultiplied(40, 140, 255, 90)) };
+        for (pts, closed) in path.flatten() {
+            let mut sp: Vec<Pos2> = pts.iter().map(|p| s(*p)).collect();
+            if closed {
+                if let Some(f) = sp.first().copied() {
+                    sp.push(f);
+                }
+            }
+            painter.add(Shape::line(sp, stroke));
+        }
+        if active && matches!(tools.tool, Tool::Pen | Tool::DirectSelect | Tool::PathSelect | Tool::FreeformPen) {
+            for sub in &path.subpaths {
+                for a in &sub.anchors {
+                    let ap = s(a.p);
+                    for hnd in [a.h_in, a.h_out] {
+                        if hnd != a.p {
+                            painter.line_segment([ap, s(hnd)], EStroke::new(1.0_f32, Color32::from_gray(160)));
+                            painter.circle_filled(s(hnd), 3.0, Color32::from_rgb(40, 140, 255));
+                        }
+                    }
+                    painter.rect_filled(Rect::from_center_size(ap, Vec2::splat(6.0)), 0.0, Color32::WHITE);
+                    painter.rect_stroke(Rect::from_center_size(ap, Vec2::splat(6.0)), 0.0, EStroke::new(1.0_f32, Color32::from_rgb(40, 140, 255)));
+                }
+            }
+        }
+    }
+
+    // Interaction previews.
     let dashed = |painter: &egui::Painter, pts: &[Pos2]| {
         painter.add(Shape::line(pts.to_vec(), EStroke::new(1.0_f32, Color32::BLACK)));
         painter.extend(Shape::dashed_line(pts, EStroke::new(1.0_f32, Color32::WHITE), 4.0, 4.0));
+    };
+    let ellipse = |r: Rect| -> Vec<Pos2> {
+        (0..=64)
+            .map(|i| {
+                let t = i as f32 / 64.0 * std::f32::consts::TAU;
+                r.center() + Vec2::new(t.cos() * r.width() * 0.5, t.sin() * r.height() * 0.5)
+            })
+            .collect()
     };
     match &tools.interaction {
         Interaction::Marquee { start, current, .. } => {
             let r = Rect::from_two_pos(s(*start), s(*current));
             if tools.tool == Tool::EllipseMarquee {
-                let pts: Vec<Pos2> = (0..=64)
-                    .map(|i| {
-                        let t = i as f32 / 64.0 * std::f32::consts::TAU;
-                        r.center() + Vec2::new(t.cos() * r.width() * 0.5, t.sin() * r.height() * 0.5)
-                    })
-                    .collect();
-                dashed(&painter, &pts);
+                dashed(&painter, &ellipse(r));
             } else {
                 dashed(&painter, &[r.left_top(), r.right_top(), r.right_bottom(), r.left_bottom(), r.left_top()]);
             }
@@ -352,35 +560,79 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
             painter.circle_filled(s(*start), 3.0, Color32::WHITE);
         }
         Interaction::Shape { start, current } => {
-            let r = Rect::from_two_pos(s(*start), s(*current));
-            match tools.shape_kind {
-                forge_core::fill::ShapeKind::Rectangle => {
-                    painter.rect_stroke(r, 0.0, accent);
-                }
-                forge_core::fill::ShapeKind::Ellipse => {
-                    let pts: Vec<Pos2> = (0..=64)
-                        .map(|i| {
-                            let t = i as f32 / 64.0 * std::f32::consts::TAU;
-                            r.center() + Vec2::new(t.cos() * r.width() * 0.5, t.sin() * r.height() * 0.5)
-                        })
-                        .collect();
-                    painter.add(Shape::line(pts, accent));
-                }
-                forge_core::fill::ShapeKind::Line => {
-                    painter.line_segment([s(*start), s(*current)], EStroke::new((tools.shape_line_width * view.zoom).max(1.0), Color32::from_rgba_unmultiplied(198, 244, 50, 140)));
+            let params = forge_core::shapes::ShapeParams { line_width: tools.shape_stroke_width, ..tools.shape_params };
+            let pts: Vec<Pos2> = forge_core::shapes::outline(tools.shape_kind, *start, *current, &params).into_iter().map(s).collect();
+            let mut closed = pts.clone();
+            if !tools.shape_kind.is_open() {
+                if let Some(f) = closed.first().copied() {
+                    closed.push(f);
                 }
             }
+            painter.add(Shape::line(closed, accent));
         }
         Interaction::Crop { start, current } => draw_crop(&painter, img_rect, Rect::from_two_pos(s(*start), s(*current))),
+        Interaction::Ruler { start, current } => draw_ruler(&painter, s(*start), s(*current), *start, *current),
         _ => {}
+    }
+    if let (Some((a, b)), Interaction::None) = (tools.ruler, &tools.interaction) {
+        if tools.tool == Tool::Ruler {
+            draw_ruler(&painter, s(a), s(b), a, b);
+        }
     }
     if let Some(r) = tab.pending_crop {
         draw_crop(&painter, img_rect, Rect::from_two_pos(s(Point::new(r.x0 as f32, r.y0 as f32)), s(Point::new(r.x1 as f32, r.y1 as f32))));
     }
-    if let (Tool::CloneStamp, Some(src)) = (tools.tool, tools.clone_source) {
+    if let Some(q) = tools.persp_crop {
+        let pts: Vec<Pos2> = q.iter().map(|p| s(*p)).collect();
+        let mut closed = pts.clone();
+        closed.push(pts[0]);
+        painter.add(Shape::line(closed, EStroke::new(1.5_f32, Color32::WHITE)));
+        for i in 1..3 {
+            let t = i as f32 / 3.0;
+            painter.line_segment([pts[0] + (pts[1] - pts[0]) * t, pts[3] + (pts[2] - pts[3]) * t], EStroke::new(1.0_f32, Color32::from_white_alpha(80)));
+            painter.line_segment([pts[0] + (pts[3] - pts[0]) * t, pts[1] + (pts[2] - pts[1]) * t], EStroke::new(1.0_f32, Color32::from_white_alpha(80)));
+        }
+        for p in pts {
+            painter.rect_filled(Rect::from_center_size(p, Vec2::splat(8.0)), 0.0, Color32::WHITE);
+        }
+    }
+    if let Some(t) = &tools.transform {
+        let pts: Vec<Pos2> = t.quad.iter().map(|p| s(*p)).collect();
+        let mut closed = pts.clone();
+        closed.push(pts[0]);
+        painter.add(Shape::line(closed, EStroke::new(1.0_f32, Color32::from_rgb(40, 140, 255))));
+        if t.mode == crate::tools::TransformMode::Warp {
+            let g: Vec<Pos2> = t.grid.iter().map(|p| s(*p)).collect();
+            for r in 0..4 {
+                painter.add(Shape::line((0..4).map(|c| g[r * 4 + c]).collect(), EStroke::new(1.0_f32, Color32::from_gray(200))));
+                painter.add(Shape::line((0..4).map(|c| g[c * 4 + r]).collect(), EStroke::new(1.0_f32, Color32::from_gray(200))));
+            }
+            for p in g {
+                painter.circle_filled(p, 4.0, Color32::WHITE);
+                painter.circle_stroke(p, 4.0, EStroke::new(1.0_f32, Color32::BLACK));
+            }
+        } else {
+            for i in 0..4 {
+                let handles = [pts[i], pts[i] + (pts[(i + 1) % 4] - pts[i]) * 0.5];
+                for hp in handles {
+                    let r = Rect::from_center_size(hp, Vec2::splat(8.0));
+                    painter.rect_filled(r, 0.0, Color32::WHITE);
+                    painter.rect_stroke(r, 0.0, EStroke::new(1.0_f32, Color32::BLACK));
+                }
+            }
+            let c = s(t.center());
+            painter.circle_stroke(c, 4.0, EStroke::new(1.0_f32, Color32::WHITE));
+        }
+    }
+    if let (Tool::CloneStamp | Tool::Healing, Some(src)) = (tools.tool, tools.clone_source) {
         let p = s(src);
         painter.line_segment([p - Vec2::new(6.0, 0.0), p + Vec2::new(6.0, 0.0)], EStroke::new(1.5_f32, Color32::RED));
         painter.line_segment([p - Vec2::new(0.0, 6.0), p + Vec2::new(0.0, 6.0)], EStroke::new(1.5_f32, Color32::RED));
+    }
+
+    // Rulers.
+    if view.show_rulers {
+        draw_rulers(&painter, view, rect, w, h, hover_pos);
     }
 
     // Cursor.
@@ -388,8 +640,9 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
         let busy_pan = panning_tool || tab.view.space_pan;
         if busy_pan {
             ctx.set_cursor_icon(if pointer.any_down() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
-        } else if tools.tool.is_paint() {
-            let size = tools.current_brush().map(|b| b.size).unwrap_or(1.0);
+        } else if tools.transform.is_some() {
+            ctx.set_cursor_icon(egui::CursorIcon::Move);
+        } else if let Some(size) = tools.brush_size() {
             let r = (size * 0.5 * tab.view.zoom).max(1.0);
             painter.circle_stroke(pos, r, EStroke::new(1.0_f32, Color32::BLACK));
             painter.circle_stroke(pos, r + 1.0, EStroke::new(1.0_f32, Color32::from_white_alpha(200)));
@@ -398,11 +651,96 @@ pub fn canvas_ui(ui: &mut egui::Ui, tab: &mut DocTab, tools: &mut ToolState, int
             ctx.set_cursor_icon(match tools.tool {
                 Tool::Move => egui::CursorIcon::Move,
                 Tool::Text => egui::CursorIcon::Text,
+                Tool::VerticalText => egui::CursorIcon::VerticalText,
                 Tool::Zoom => egui::CursorIcon::ZoomIn,
+                Tool::PathSelect | Tool::DirectSelect => egui::CursorIcon::Default,
                 _ => egui::CursorIcon::Crosshair,
             });
         }
     }
+}
+
+fn draw_grid(painter: &egui::Painter, view: &View, rect: Rect, w: u32, h: u32, vis: Rect, step: f32, col: Color32) {
+    let a = view.to_image(rect, w, h, vis.min);
+    let b = view.to_image(rect, w, h, vis.max);
+    let st = EStroke::new(1.0_f32, col);
+    let mut x = (a.x.max(0.0) / step).floor() * step;
+    while x <= b.x.min(w as f32) {
+        let sx = view.to_screen(rect, w, h, Point::new(x, 0.0)).x;
+        painter.line_segment([Pos2::new(sx, vis.min.y), Pos2::new(sx, vis.max.y)], st);
+        x += step;
+    }
+    let mut y = (a.y.max(0.0) / step).floor() * step;
+    while y <= b.y.min(h as f32) {
+        let sy = view.to_screen(rect, w, h, Point::new(0.0, y)).y;
+        painter.line_segment([Pos2::new(vis.min.x, sy), Pos2::new(vis.max.x, sy)], st);
+        y += step;
+    }
+}
+
+fn draw_rulers(painter: &egui::Painter, view: &View, rect: Rect, w: u32, h: u32, hover: Option<Pos2>) {
+    let bg = Color32::from_rgb(40, 39, 46);
+    let fg = Color32::from_gray(150);
+    let top = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.min.y + RULER));
+    let left = Rect::from_min_max(rect.min, Pos2::new(rect.min.x + RULER, rect.max.y));
+    painter.rect_filled(top, 0.0, bg);
+    painter.rect_filled(left, 0.0, bg);
+    // Pick a tick spacing of >= 50 screen px.
+    let steps = [1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0];
+    let major = steps.iter().copied().find(|s| s * view.zoom >= 50.0).unwrap_or(10000.0);
+    let minor = major / 5.0;
+    let font = egui::FontId::monospace(9.0);
+    let a = view.to_image(rect, w, h, rect.min);
+    let b = view.to_image(rect, w, h, rect.max);
+    let mut x = (a.x / minor).floor() * minor;
+    while x <= b.x {
+        let sx = view.to_screen(rect, w, h, Point::new(x, 0.0)).x;
+        if sx > rect.min.x + RULER {
+            let is_major = (x / major).round() * major == x;
+            let len = if is_major { RULER } else { 5.0 };
+            painter.line_segment([Pos2::new(sx, top.max.y - len), Pos2::new(sx, top.max.y)], EStroke::new(1.0_f32, fg));
+            if is_major {
+                painter.text(Pos2::new(sx + 2.0, top.min.y + 1.0), egui::Align2::LEFT_TOP, format!("{}", x as i64), font.clone(), fg);
+            }
+        }
+        x += minor;
+    }
+    let mut y = (a.y / minor).floor() * minor;
+    while y <= b.y {
+        let sy = view.to_screen(rect, w, h, Point::new(0.0, y)).y;
+        if sy > rect.min.y + RULER {
+            let is_major = (y / major).round() * major == y;
+            let len = if is_major { RULER } else { 5.0 };
+            painter.line_segment([Pos2::new(left.max.x - len, sy), Pos2::new(left.max.x, sy)], EStroke::new(1.0_f32, fg));
+            if is_major {
+                painter.text(Pos2::new(left.min.x + 1.0, sy + 2.0), egui::Align2::LEFT_TOP, format!("{}", y as i64), font.clone(), fg);
+            }
+        }
+        y += minor;
+    }
+    painter.rect_filled(Rect::from_min_size(rect.min, Vec2::splat(RULER)), 0.0, bg);
+    if let Some(p) = hover {
+        let acc = crate::app::ACCENT;
+        painter.line_segment([Pos2::new(p.x, top.min.y), Pos2::new(p.x, top.max.y)], EStroke::new(1.0_f32, acc));
+        painter.line_segment([Pos2::new(left.min.x, p.y), Pos2::new(left.max.x, p.y)], EStroke::new(1.0_f32, acc));
+    }
+}
+
+fn draw_ruler(painter: &egui::Painter, a: Pos2, b: Pos2, ia: Point, ib: Point) {
+    painter.line_segment([a, b], EStroke::new(3.0_f32, Color32::BLACK));
+    painter.line_segment([a, b], EStroke::new(1.0_f32, Color32::WHITE));
+    for p in [a, b] {
+        painter.line_segment([p - Vec2::new(5.0, 0.0), p + Vec2::new(5.0, 0.0)], EStroke::new(1.0_f32, Color32::WHITE));
+        painter.line_segment([p - Vec2::new(0.0, 5.0), p + Vec2::new(0.0, 5.0)], EStroke::new(1.0_f32, Color32::WHITE));
+    }
+    let ang = -(ib.y - ia.y).atan2(ib.x - ia.x).to_degrees();
+    painter.text(
+        b + Vec2::new(8.0, -8.0),
+        egui::Align2::LEFT_BOTTOM,
+        format!("{:.1} px  {:.1}°", ia.distance(ib), ang),
+        egui::FontId::proportional(12.0),
+        Color32::WHITE,
+    );
 }
 
 fn draw_crop(painter: &egui::Painter, img: Rect, r: Rect) {

@@ -33,6 +33,14 @@ pub struct TiledBuffer<P: Pixel> {
     tiles: Vec<Option<Tile<P>>>,
 }
 
+/// Identity comparison: equal when both buffers share the same tiles
+/// (O(tiles), no pixel reads). Used for cheap change detection.
+impl<P: Pixel> PartialEq for TiledBuffer<P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.fill == other.fill && self.diff_rect(other).is_none()
+    }
+}
+
 impl<P: Pixel> TiledBuffer<P> {
     /// Creates an empty buffer where every pixel is `P::default()`.
     pub fn new(width: u32, height: u32) -> Self {

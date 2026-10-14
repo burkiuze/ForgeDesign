@@ -1,179 +1,25 @@
-//! The application shell: menus, shortcuts, panels, tabs and dialogs.
+//! The application shell: state, file operations, clipboard, panels,
+//! tabs, dialogs and autosave. Commands and menus live in `commands.rs`.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers, RichText};
-use forge_core::adjust::{self, Adjustment, Channel, Levels};
+use eframe::egui::{self, Color32, RichText};
 use forge_core::buffer::TiledBuffer;
 use forge_core::document::Document;
 use forge_core::filters::Filter;
-use forge_core::selection::{self, Mask};
-use forge_core::transform::{self, Orientation};
-use forge_core::{composite, fill, BlendMode, Color, IRect, Layer, Rgba8};
+use forge_core::selection;
+use forge_core::styles::LayerStyle;
+use forge_core::transform;
+use forge_core::{composite, fill, Color, IRect, Layer, Rgba8};
 
+use crate::actions::Recorder;
 use crate::canvas::{self, DocTab};
+use crate::commands::Cmd;
 use crate::dialogs::{self, Outcome};
-use crate::panels::{self, LayerAction, LayersUi};
+use crate::panels::{self, BrushPreset, LayerAction, LayersUi};
 use crate::text::{self, FontEntry};
-use crate::tools::{Tool, ToolState};
-
-enum Dialog {
-    New(dialogs::NewDoc),
-    ImageSize(dialogs::ImageSize),
-    CanvasSize(dialogs::CanvasSize),
-    Adjust(Box<dialogs::AdjustDialog>),
-    Filter(Box<dialogs::FilterDialog>),
-    Transform(Box<dialogs::TransformDialog>),
-    Text(dialogs::TextDialog),
-    Fill(dialogs::FillDialog),
-    Stroke(dialogs::StrokeDialog),
-    SelModify(dialogs::SelModify),
-    About,
-    Shortcuts,
-    Message(String, String),
-    ConfirmClose { tab: usize, quit: bool },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Cmd {
-    New,
-    Open,
-    Place,
-    Save,
-    SaveAs,
-    Export,
-    Close,
-    Quit,
-    Undo,
-    Redo,
-    Cut,
-    Copy,
-    CopyMerged,
-    Paste,
-    Clear,
-    FillDialog,
-    FillFg,
-    FillBg,
-    Stroke,
-    Transform,
-    ImageSize,
-    CanvasSize,
-    Orient(Orientation),
-    CropToSelection,
-    Trim,
-    Flatten,
-    AutoContrast,
-    Adjust(usize),
-    Filter(usize),
-    RepeatFilter,
-    NewLayer,
-    DuplicateOrViaCopy,
-    DeleteLayer,
-    MergeDown,
-    StampVisible,
-    LayerUp,
-    LayerDown,
-    LayerTop,
-    LayerBottom,
-    AddMask,
-    MaskFromSelection,
-    DeleteMask,
-    ApplyMask,
-    ToggleLockAlpha,
-    SelectAll,
-    Deselect,
-    Inverse,
-    SelModify(dialogs::SelModifyKind),
-    SelectionFromAlpha,
-    ZoomIn,
-    ZoomOut,
-    Fit,
-    ActualPixels,
-    About,
-    Shortcuts,
-}
-
-/// Adjustment menu entries: (label, shortcut).
-const ADJUSTMENTS: [(&str, &str); 14] = [
-    ("Brightness/Contrast…", ""),
-    ("Levels…", "Ctrl+L"),
-    ("Curves…", "Ctrl+M"),
-    ("Exposure…", ""),
-    ("Vibrance…", ""),
-    ("Hue/Saturation…", "Ctrl+U"),
-    ("Color Balance…", "Ctrl+B"),
-    ("Black & White", "Alt+Shift+Ctrl+B"),
-    ("Photo Filter…", ""),
-    ("Gradient Map…", ""),
-    ("Invert", "Ctrl+I"),
-    ("Posterize…", ""),
-    ("Threshold…", ""),
-    ("Desaturate", "Shift+Ctrl+U"),
-];
-
-fn default_adjustment(i: usize, fg: Color, bg: Color) -> Adjustment {
-    match i {
-        0 => Adjustment::BrightnessContrast { brightness: 0.0, contrast: 0.0 },
-        1 => Adjustment::Levels { channel: Channel::Rgb, levels: Levels::default() },
-        2 => Adjustment::Curves { channel: Channel::Rgb, points: vec![(0.0, 0.0), (255.0, 255.0)] },
-        3 => Adjustment::Exposure { exposure: 0.0, offset: 0.0, gamma: 1.0 },
-        4 => Adjustment::Vibrance { vibrance: 0.0, saturation: 0.0 },
-        5 => Adjustment::HueSaturation { hue: 0.0, saturation: 0.0, lightness: 0.0, colorize: false },
-        6 => Adjustment::ColorBalance { shadows: [0.0; 3], midtones: [0.0; 3], highlights: [0.0; 3] },
-        7 => Adjustment::BlackAndWhite,
-        8 => Adjustment::PhotoFilter { color: Color::rgb(0.93, 0.54, 0.1), density: 0.25 },
-        9 => Adjustment::GradientMap { from: fg, to: bg },
-        10 => Adjustment::Invert,
-        11 => Adjustment::Posterize { levels: 4 },
-        12 => Adjustment::Threshold { level: 128 },
-        _ => Adjustment::Desaturate,
-    }
-}
-
-/// Filter menu: (submenu, label, factory).
-const FILTERS: [(&str, &str); 14] = [
-    ("Blur", "Gaussian Blur…"),
-    ("Blur", "Box Blur…"),
-    ("Blur", "Motion Blur…"),
-    ("Sharpen", "Sharpen"),
-    ("Sharpen", "Unsharp Mask…"),
-    ("Noise", "Add Noise…"),
-    ("Noise", "Median…"),
-    ("Distort", "Twirl…"),
-    ("Distort", "Wave…"),
-    ("Pixelate", "Mosaic…"),
-    ("Stylize", "Emboss…"),
-    ("Stylize", "Find Edges"),
-    ("Other", "High Pass…"),
-    ("Render", "Clouds…"),
-];
-
-fn default_filter(i: usize, fg: Color, bg: Color) -> Filter {
-    match i {
-        0 => Filter::GaussianBlur { radius: 4.0 },
-        1 => Filter::BoxBlur { radius: 4 },
-        2 => Filter::MotionBlur { angle: 0.0, distance: 20.0 },
-        3 => Filter::Sharpen,
-        4 => Filter::UnsharpMask { amount: 1.0, radius: 1.5, threshold: 0 },
-        5 => Filter::AddNoise { amount: 0.12, monochrome: false, seed: 1 },
-        6 => Filter::Median { radius: 2 },
-        7 => Filter::Twirl { angle: 120.0 },
-        8 => Filter::Wave { amplitude: 10.0, wavelength: 120.0 },
-        9 => Filter::Pixelate { size: 12 },
-        10 => Filter::Emboss { angle: 135.0, amount: 1.0 },
-        11 => Filter::FindEdges,
-        12 => Filter::HighPass { radius: 10.0 },
-        _ => Filter::Clouds { fg, bg, scale: 200.0, seed: 7 },
-    }
-}
-
-fn instant_filter(f: &Filter) -> bool {
-    matches!(f, Filter::Sharpen | Filter::FindEdges)
-}
-
-fn instant_adjustment(a: &Adjustment) -> bool {
-    matches!(a, Adjustment::Invert | Adjustment::Desaturate | Adjustment::BlackAndWhite)
-}
+use crate::tools::ToolState;
 
 /// Brand colours (from the logo).
 pub const ACCENT: Color32 = Color32::from_rgb(198, 244, 50);
@@ -181,33 +27,108 @@ pub const ACCENT_DIM: Color32 = Color32::from_rgb(78, 96, 30);
 pub const INK: Color32 = Color32::from_rgb(24, 23, 28);
 pub const PAPER: Color32 = Color32::from_rgb(238, 234, 226);
 
-struct Clip {
-    pixels: TiledBuffer<Rgba8>,
-    origin: IRect,
+/// Name of the temporary layer used by Quick Mask mode.
+pub const QUICK_MASK: &str = "Quick Mask";
+
+pub enum Dialog {
+    New(dialogs::NewDoc),
+    ImageSize(dialogs::ImageSize),
+    CanvasSize(dialogs::CanvasSize),
+    Adjust(Box<dialogs::AdjustDialog>),
+    Filter(Box<dialogs::FilterDialog>),
+    Transform(Box<dialogs::TransformDialog>),
+    Text(Box<dialogs::TextDialog>),
+    Fill(dialogs::FillDialog),
+    Stroke(dialogs::StrokeDialog),
+    SelModify(dialogs::SelModify),
+    LayerStyle(Box<dialogs::LayerStyleDialog>),
+    ColorRange(dialogs::ColorRangeDialog),
+    FocusArea(dialogs::FocusAreaDialog),
+    Batch(dialogs::BatchDialog),
+    NewGuide(dialogs::NewGuideDialog),
+    Animation(dialogs::AnimationDialog),
+    Recovery(Vec<PathBuf>),
+    About,
+    Shortcuts,
+    Message(String, String),
+    ConfirmClose { tab: usize, quit: bool },
+}
+
+pub struct Clip {
+    pub pixels: TiledBuffer<Rgba8>,
+    pub origin: IRect,
+}
+
+/// Which panels are shown (Window menu).
+pub struct Panels {
+    pub color: bool,
+    pub swatches: bool,
+    pub histogram: bool,
+    pub navigator: bool,
+    pub info: bool,
+    pub properties: bool,
+    pub layers: bool,
+    pub paths: bool,
+    pub history: bool,
+    pub actions: bool,
+    pub brushes: bool,
+}
+
+impl Default for Panels {
+    fn default() -> Self {
+        Self {
+            color: true,
+            swatches: false,
+            histogram: false,
+            navigator: true,
+            info: false,
+            properties: true,
+            layers: true,
+            paths: false,
+            history: true,
+            actions: false,
+            brushes: false,
+        }
+    }
 }
 
 pub struct ForgeApp {
-    tabs: Vec<DocTab>,
-    active: usize,
-    tools: ToolState,
-    dialog: Option<Dialog>,
+    pub tabs: Vec<DocTab>,
+    pub active: usize,
+    pub tools: ToolState,
+    pub dialog: Option<Dialog>,
     layers_ui: LayersUi,
     editing_bg: bool,
     hex_buf: String,
-    fonts: Vec<FontEntry>,
-    clipboard: Option<Clip>,
-    last_filter: Option<Filter>,
-    show_color: bool,
-    show_histogram: bool,
-    show_layers: bool,
-    show_history: bool,
+    pub fonts: Vec<FontEntry>,
+    pub clipboard: Option<Clip>,
+    pub last_filter: Option<Filter>,
+    pub panels: Panels,
     quit_confirmed: bool,
     title: String,
+    pub recorder: Recorder,
+    pub style_clipboard: Option<LayerStyle>,
+    pub brush_presets: Vec<BrushPreset>,
+    pub swatches: Vec<Color>,
+    pub fullscreen: bool,
+    pub hide_panels: bool,
+    pub light_theme: bool,
+    last_autosave: Instant,
+}
+
+fn recovery_dir() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir)
+        .join("forge-design")
+        .join("recovery")
 }
 
 impl ForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>, files: Vec<PathBuf>) -> Self {
-        setup_style(&cc.egui_ctx);
+        setup_style(&cc.egui_ctx, false);
         let mut app = Self {
             tabs: Vec::new(),
             active: 0,
@@ -219,33 +140,41 @@ impl ForgeApp {
             fonts: text::discover_fonts(),
             clipboard: None,
             last_filter: None,
-            show_color: true,
-            show_histogram: true,
-            show_layers: true,
-            show_history: true,
+            panels: Panels::default(),
             quit_confirmed: false,
             title: String::new(),
+            recorder: Recorder::load(),
+            style_clipboard: None,
+            brush_presets: panels::default_presets(),
+            swatches: Vec::new(),
+            fullscreen: false,
+            hide_panels: false,
+            light_theme: false,
+            last_autosave: Instant::now(),
         };
         for f in files {
             app.open_path(&f);
         }
+        // Offer to recover documents from a crash.
+        if let Ok(rd) = std::fs::read_dir(recovery_dir()) {
+            let found: Vec<PathBuf> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "ora")).collect();
+            if !found.is_empty() {
+                app.dialog = Some(Dialog::Recovery(found));
+            }
+        }
         app
     }
 
-    fn tab(&mut self) -> Option<&mut DocTab> {
-        self.tabs.get_mut(self.active)
-    }
-
-    fn add_tab(&mut self, doc: Document) {
+    pub fn add_tab(&mut self, doc: Document) {
         self.tabs.push(DocTab::new(doc));
         self.active = self.tabs.len() - 1;
     }
 
-    fn error(&mut self, msg: impl Into<String>) {
+    pub fn error(&mut self, msg: impl Into<String>) {
         self.dialog = Some(Dialog::Message("Error".into(), msg.into()));
     }
 
-    fn open_path(&mut self, path: &Path) {
+    pub fn open_path(&mut self, path: &Path) {
         match forge_io::open(path) {
             Ok(doc) => self.add_tab(doc),
             Err(e) => self.error(format!("Could not open {}:\n{e}", path.display())),
@@ -254,7 +183,7 @@ impl ForgeApp {
 
     // ------------------------------------------------------------ file ops
 
-    fn open_dialog(&mut self) {
+    pub fn open_dialog(&mut self) {
         let files = rfd::FileDialog::new()
             .add_filter("All supported images", forge_io::OPEN_EXTENSIONS)
             .add_filter("OpenRaster", &["ora"])
@@ -265,13 +194,18 @@ impl ForgeApp {
         }
     }
 
-    fn save(&mut self, save_as: bool) -> bool {
+    pub fn save(&mut self, save_as: bool) -> bool {
         let Some(tab) = self.tabs.get_mut(self.active) else { return false };
         let path = match (&tab.doc.path, save_as) {
             (Some(p), false) => p.clone(),
             _ => {
                 let stem = tab.doc.name.rsplit_once('.').map_or(tab.doc.name.as_str(), |(s, _)| s).to_string();
-                match rfd::FileDialog::new().add_filter("OpenRaster (layered)", &["ora"]).set_file_name(format!("{stem}.ora")).save_file() {
+                match rfd::FileDialog::new()
+                    .add_filter("OpenRaster (layered, native)", &["ora"])
+                    .add_filter("Photoshop (layered)", &["psd"])
+                    .set_file_name(format!("{stem}.ora"))
+                    .save_file()
+                {
                     Some(p) => {
                         if p.extension().is_none() {
                             p.with_extension("ora")
@@ -288,6 +222,7 @@ impl ForgeApp {
                 tab.doc.mark_saved();
                 tab.doc.name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Untitled").to_string();
                 tab.doc.path = Some(path);
+                let _ = std::fs::remove_file(recovery_dir().join(format!("{}.ora", tab.id)));
                 self.tools.status = "Saved".into();
                 true
             }
@@ -298,25 +233,36 @@ impl ForgeApp {
         }
     }
 
-    fn export(&mut self) {
+    pub fn export(&mut self, quick: Option<&str>) {
         let Some(tab) = self.tabs.get(self.active) else { return };
         let stem = tab.doc.name.rsplit_once('.').map_or(tab.doc.name.as_str(), |(s, _)| s).to_string();
-        let Some(mut path) = rfd::FileDialog::new()
-            .add_filter("PNG", &["png"])
-            .add_filter("JPEG", &["jpg", "jpeg"])
-            .add_filter("WebP", &["webp"])
-            .add_filter("TIFF", &["tif", "tiff"])
-            .add_filter("BMP", &["bmp"])
-            .add_filter("TGA", &["tga"])
-            .add_filter("GIF", &["gif"])
-            .add_filter("QOI", &["qoi"])
-            .set_file_name(format!("{stem}.png"))
-            .save_file()
-        else {
-            return;
-        };
+        let mut dlg = rfd::FileDialog::new();
+        match quick {
+            Some("pdf") => dlg = dlg.add_filter("PDF", &["pdf"]),
+            Some(ext) => dlg = dlg.add_filter(ext.to_uppercase(), &[ext]),
+            None => {
+                for (n, e) in [
+                    ("PNG", &["png"][..]),
+                    ("JPEG", &["jpg", "jpeg"]),
+                    ("WebP", &["webp"]),
+                    ("TIFF", &["tif", "tiff"]),
+                    ("PDF", &["pdf"]),
+                    ("SVG (image + paths)", &["svg"]),
+                    ("Photoshop", &["psd"]),
+                    ("BMP", &["bmp"]),
+                    ("TGA", &["tga"]),
+                    ("GIF", &["gif"]),
+                    ("QOI", &["qoi"]),
+                    ("ICO", &["ico"]),
+                ] {
+                    dlg = dlg.add_filter(n, e);
+                }
+            }
+        }
+        let ext = quick.unwrap_or("png");
+        let Some(mut path) = dlg.set_file_name(format!("{stem}.{ext}")).save_file() else { return };
         if path.extension().is_none() {
-            path.set_extension("png");
+            path.set_extension(ext);
         }
         match forge_io::export(&tab.doc.state, &path, forge_io::ExportOptions::default()) {
             Ok(()) => self.tools.status = format!("Exported {}", path.display()),
@@ -324,23 +270,36 @@ impl ForgeApp {
         }
     }
 
-    fn place(&mut self) {
+    pub fn export_layers(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let Some(dir) = rfd::FileDialog::new().pick_folder() else { return };
+        let stem = tab.doc.name.rsplit_once('.').map_or(tab.doc.name.as_str(), |(s, _)| s).to_string();
+        match forge_io::export_layers(&tab.doc.state, &dir, &stem) {
+            Ok(n) => self.tools.status = format!("Exported {n} layers to {}", dir.display()),
+            Err(e) => self.error(format!("Could not export layers:\n{e}")),
+        }
+    }
+
+    pub fn place(&mut self) {
         let Some(path) = rfd::FileDialog::new().add_filter("Images", forge_io::OPEN_EXTENSIONS).pick_file() else { return };
         let img = match forge_io::load_image(&path) {
             Ok(i) => i,
             Err(e) => return self.error(format!("Could not place {}:\n{e}", path.display())),
         };
-        let Some(tab) = self.tab() else { return };
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let (w, h) = (tab.doc.width(), tab.doc.height());
         let dx = (w as i32 - img.width() as i32) / 2;
         let dy = (h as i32 - img.height() as i32) / 2;
         let pixels = transform::translate(&img, dx, dy, w, h);
         let id = tab.doc.state.alloc_id();
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Placed").to_string();
-        tab.doc.add_layer(Layer::with_pixels(id, name, pixels), "Place");
+        // Placed images are Smart Objects, like in Photoshop.
+        let mut l = Layer::with_pixels(id, name, pixels.clone());
+        l.smart = Some(Box::new(forge_core::layer::SmartObject::new(pixels)));
+        tab.doc.add_layer(l, "Place");
     }
 
-    fn request_close_tab(&mut self, i: usize) {
+    pub fn request_close_tab(&mut self, i: usize) {
         if i >= self.tabs.len() {
             return;
         }
@@ -348,14 +307,39 @@ impl ForgeApp {
             self.active = i;
             self.dialog = Some(Dialog::ConfirmClose { tab: i, quit: false });
         } else {
-            self.tabs.remove(i);
-            self.active = self.active.min(self.tabs.len().saturating_sub(1));
+            self.close_tab(i);
+        }
+    }
+
+    fn close_tab(&mut self, i: usize) {
+        let t = self.tabs.remove(i);
+        let _ = std::fs::remove_file(recovery_dir().join(format!("{}.ora", t.id)));
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+    }
+
+    /// Writes modified documents to the recovery folder every two minutes.
+    fn autosave(&mut self) {
+        if self.last_autosave.elapsed() < Duration::from_secs(120) {
+            return;
+        }
+        self.last_autosave = Instant::now();
+        let dir = recovery_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        for t in &self.tabs {
+            let path = dir.join(format!("{}.ora", t.id));
+            if t.doc.is_modified() {
+                if let Ok(bytes) = forge_io::write_ora(&t.doc.state) {
+                    let _ = std::fs::write(path, bytes);
+                }
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
         }
     }
 
     // ------------------------------------------------------------ clipboard
 
-    fn copy(&mut self, merged: bool, cut: bool) {
+    pub fn copy(&mut self, merged: bool, cut: bool) {
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let sel = tab.doc.state.selection.clone();
         let src = if merged {
@@ -384,7 +368,7 @@ impl ForgeApp {
         }
     }
 
-    fn paste(&mut self) {
+    pub fn paste(&mut self) {
         let Some(clip) = &self.clipboard else { return };
         let (cw, ch) = (clip.pixels.width() as i32, clip.pixels.height() as i32);
         let origin = clip.origin;
@@ -402,7 +386,7 @@ impl ForgeApp {
         tab.doc.add_layer(Layer::with_pixels(id, "Pasted", pixels), "Paste");
     }
 
-    fn paste_as_new_document(&mut self) {
+    pub fn paste_as_new_document(&mut self) {
         let Some(clip) = &self.clipboard else { return };
         let mut doc = Document::new("Clipboard", clip.pixels.width(), clip.pixels.height(), None);
         doc.state.layers[0].pixels = clip.pixels.clone();
@@ -410,8 +394,8 @@ impl ForgeApp {
         self.add_tab(doc);
     }
 
-    fn clear_selection_pixels(&mut self, label: &str) {
-        let Some(tab) = self.tab() else { return };
+    pub fn clear_selection_pixels(&mut self, label: &str) {
+        let Some(tab) = self.tabs.get_mut(self.active) else { return };
         let sel = tab.doc.state.selection.clone();
         let editing_mask = tab.doc.state.editing_mask;
         let Some(layer) = tab.doc.state.active_layer_mut() else { return };
@@ -426,7 +410,7 @@ impl ForgeApp {
                 *v = (*v as f32 * (1.0 - s)) as u8;
             });
             Some(rect)
-        } else if layer.lock_alpha {
+        } else if layer.lock_alpha || !layer.has_pixels() {
             None
         } else {
             fill::clear(&mut layer.pixels, sel.as_ref())
@@ -434,525 +418,6 @@ impl ForgeApp {
         if let Some(r) = r {
             tab.doc.mark_dirty(r);
             tab.doc.commit(label);
-        }
-    }
-
-    // ------------------------------------------------------------- commands
-
-    pub fn run(&mut self, cmd: Cmd, ctx: &egui::Context) {
-        if self.tools.is_busy() {
-            return;
-        }
-        let (fg, bg) = (self.tools.fg, self.tools.bg);
-        match cmd {
-            Cmd::New => {
-                let mut nd = dialogs::NewDoc::default();
-                if let Some(c) = &self.clipboard {
-                    nd.width = c.pixels.width();
-                    nd.height = c.pixels.height();
-                }
-                nd.name = format!("Untitled-{}", self.tabs.len() + 1);
-                self.dialog = Some(Dialog::New(nd));
-            }
-            Cmd::Open => self.open_dialog(),
-            Cmd::Place => self.place(),
-            Cmd::Save => {
-                self.save(false);
-            }
-            Cmd::SaveAs => {
-                self.save(true);
-            }
-            Cmd::Export => self.export(),
-            Cmd::Close => self.request_close_tab(self.active),
-            Cmd::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            Cmd::About => self.dialog = Some(Dialog::About),
-            Cmd::Shortcuts => self.dialog = Some(Dialog::Shortcuts),
-            Cmd::Copy => self.copy(false, false),
-            Cmd::CopyMerged => self.copy(true, false),
-            Cmd::Cut => self.copy(false, true),
-            Cmd::Paste => {
-                if self.tabs.is_empty() {
-                    self.paste_as_new_document();
-                } else {
-                    self.paste();
-                }
-            }
-            Cmd::Clear => self.clear_selection_pixels("Clear"),
-            _ => {}
-        }
-        let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        let (w, h) = (tab.doc.width(), tab.doc.height());
-        let has_layer = tab.doc.state.active_layer().is_some();
-        match cmd {
-            Cmd::Undo => {
-                tab.doc.undo();
-            }
-            Cmd::Redo => {
-                tab.doc.redo();
-            }
-            Cmd::FillDialog => self.dialog = Some(Dialog::Fill(dialogs::FillDialog::new(&self.tools))),
-            Cmd::FillFg => dialogs::fill_selection(tab, fg, BlendMode::Normal, 1.0, false, "Fill"),
-            Cmd::FillBg => dialogs::fill_selection(tab, bg, BlendMode::Normal, 1.0, false, "Fill"),
-            Cmd::Stroke => {
-                if tab.doc.selection().is_some() {
-                    self.dialog = Some(Dialog::Stroke(dialogs::StrokeDialog::new(&self.tools)));
-                }
-            }
-            Cmd::Transform => {
-                if let Some(d) = dialogs::TransformDialog::new(tab) {
-                    self.dialog = Some(Dialog::Transform(Box::new(d)));
-                }
-            }
-            Cmd::ImageSize => self.dialog = Some(Dialog::ImageSize(dialogs::ImageSize::new(tab))),
-            Cmd::CanvasSize => self.dialog = Some(Dialog::CanvasSize(dialogs::CanvasSize::new(tab))),
-            Cmd::Orient(o) => {
-                transform::reorient_document(&mut tab.doc.state, o);
-                tab.doc.mark_all_dirty();
-                tab.doc.set_selection(tab.doc.state.selection.clone());
-                tab.doc.commit(o.name());
-                tab.view.request_fit();
-            }
-            Cmd::CropToSelection => {
-                if let Some(r) = tab.doc.selection().and_then(|s| s.content_bounds()) {
-                    transform::crop(&mut tab.doc.state, r);
-                    tab.doc.state.selection = None;
-                    tab.doc.set_selection(None);
-                    tab.doc.mark_all_dirty();
-                    tab.doc.commit("Crop");
-                    tab.view.request_fit();
-                }
-            }
-            Cmd::Trim => {
-                let merged = composite::merged(&tab.doc.state);
-                if let Some(r) = merged.content_bounds() {
-                    if r != tab.doc.state.bounds() {
-                        transform::crop(&mut tab.doc.state, r);
-                        tab.doc.set_selection(tab.doc.state.selection.clone());
-                        tab.doc.mark_all_dirty();
-                        tab.doc.commit("Trim");
-                        tab.view.request_fit();
-                    }
-                }
-            }
-            Cmd::Flatten => tab.doc.flatten(Color::WHITE),
-            Cmd::AutoContrast if has_layer => {
-                let layer = tab.doc.state.active;
-                let base = tab.doc.state.layers[layer].pixels.clone();
-                let sel = tab.doc.state.selection.clone();
-                let rect = selection::work_rect(sel.as_ref(), w, h);
-                for adj in adjust::auto_levels(&base, rect) {
-                    let b = tab.doc.state.layers[layer].pixels.clone();
-                    adjust::apply(&mut tab.doc.state.layers[layer].pixels, &b, sel.as_ref(), &adj);
-                }
-                tab.doc.mark_dirty(rect);
-                tab.doc.commit("Auto Contrast");
-            }
-            Cmd::Adjust(i) if has_layer => {
-                let adj = default_adjustment(i, fg, bg);
-                if instant_adjustment(&adj) {
-                    let layer = tab.doc.state.active;
-                    let base = tab.doc.state.layers[layer].pixels.clone();
-                    let sel = tab.doc.state.selection.clone();
-                    if let Some(r) = adjust::apply(&mut tab.doc.state.layers[layer].pixels, &base, sel.as_ref(), &adj) {
-                        tab.doc.mark_dirty(r);
-                        tab.doc.commit(adj.name());
-                    }
-                } else if let Some(d) = dialogs::AdjustDialog::new(tab, adj) {
-                    self.dialog = Some(Dialog::Adjust(Box::new(d)));
-                }
-            }
-            Cmd::Filter(i) if has_layer => {
-                let f = default_filter(i, fg, bg);
-                if instant_filter(&f) {
-                    apply_filter_now(tab, &f);
-                    self.last_filter = Some(f);
-                } else if let Some(d) = dialogs::FilterDialog::new(tab, f) {
-                    self.dialog = Some(Dialog::Filter(Box::new(d)));
-                }
-            }
-            Cmd::RepeatFilter if has_layer => {
-                if let Some(f) = self.last_filter.clone() {
-                    apply_filter_now(tab, &f);
-                }
-            }
-            Cmd::NewLayer => tab.doc.new_layer(),
-            Cmd::DuplicateOrViaCopy => {
-                if let (Some(sel), Some(l)) = (tab.doc.state.selection.clone(), tab.doc.state.active_layer()) {
-                    let mut px = l.pixels.clone();
-                    let name = format!("{} (copy)", l.name);
-                    px.par_map_all(|x, y, mut p| {
-                        p[3] = (p[3] as f32 * selection::coverage(Some(&sel), x, y) + 0.5) as u8;
-                        p
-                    });
-                    px.optimize();
-                    let id = tab.doc.state.alloc_id();
-                    tab.doc.add_layer(Layer::with_pixels(id, name, px), "Layer via Copy");
-                } else {
-                    tab.doc.duplicate_layer();
-                }
-            }
-            Cmd::DeleteLayer => tab.doc.delete_layer(),
-            Cmd::MergeDown => tab.doc.merge_down(),
-            Cmd::StampVisible => tab.doc.stamp_visible(),
-            Cmd::LayerUp => tab.doc.move_layer(1),
-            Cmd::LayerDown => tab.doc.move_layer(-1),
-            Cmd::LayerTop => tab.doc.move_layer(i32::MAX / 2),
-            Cmd::LayerBottom => tab.doc.move_layer(-i32::MAX / 2),
-            Cmd::AddMask => tab.doc.add_layer_mask(false),
-            Cmd::MaskFromSelection => tab.doc.add_layer_mask(true),
-            Cmd::DeleteMask => tab.doc.delete_layer_mask(false),
-            Cmd::ApplyMask => tab.doc.delete_layer_mask(true),
-            Cmd::ToggleLockAlpha => {
-                if let Some(l) = tab.doc.state.active_layer_mut() {
-                    l.lock_alpha = !l.lock_alpha;
-                    tab.doc.commit("Lock Change");
-                }
-            }
-            Cmd::SelectAll => {
-                tab.doc.set_selection(Some(selection::select_all(w, h)));
-                tab.doc.commit("Select All");
-            }
-            Cmd::Deselect => {
-                if tab.doc.selection().is_some() {
-                    tab.doc.set_selection(None);
-                    tab.doc.commit("Deselect");
-                }
-            }
-            Cmd::Inverse => {
-                let inv = selection::invert(tab.doc.selection(), w, h);
-                if tab.doc.selection().is_some() {
-                    tab.doc.set_selection(inv);
-                    tab.doc.commit("Inverse");
-                }
-            }
-            Cmd::SelModify(kind) => {
-                if tab.doc.selection().is_some() {
-                    let amount = if kind == dialogs::SelModifyKind::Feather { 5.0 } else { 3.0 };
-                    self.dialog = Some(Dialog::SelModify(dialogs::SelModify { kind, amount }));
-                }
-            }
-            Cmd::SelectionFromAlpha => {
-                let i = tab.doc.state.active;
-                selection_from_alpha(tab, i);
-            }
-            Cmd::ZoomIn => tab.view.zoom_step(1, None, w, h),
-            Cmd::ZoomOut => tab.view.zoom_step(-1, None, w, h),
-            Cmd::Fit => tab.view.request_fit(),
-            Cmd::ActualPixels => {
-                let c = tab.view.canvas_rect.center();
-                tab.view.zoom_to(1.0, c, w, h);
-            }
-            _ => {}
-        }
-    }
-
-    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        if self.dialog.is_some() {
-            return;
-        }
-        use Key::*;
-        let cmd = Modifiers::COMMAND;
-        let cs = Modifiers::COMMAND | Modifiers::SHIFT;
-        let ca = Modifiers::COMMAND | Modifiers::ALT;
-        let cas = Modifiers::COMMAND | Modifiers::ALT | Modifiers::SHIFT;
-        // Most specific modifier combinations first: egui matches "logically".
-        let table: [(Modifiers, Key, Cmd); 46] = [
-            (cas, B, Cmd::Adjust(7)),
-            (cas, E, Cmd::StampVisible),
-            (cs, Z, Cmd::Redo),
-            (cs, S, Cmd::SaveAs),
-            (cs, E, Cmd::Export),
-            (cs, N, Cmd::NewLayer),
-            (cs, I, Cmd::Inverse),
-            (cs, C, Cmd::CopyMerged),
-            (cs, U, Cmd::Adjust(13)),
-            (cs, L, Cmd::AutoContrast),
-            (cs, CloseBracket, Cmd::LayerTop),
-            (cs, OpenBracket, Cmd::LayerBottom),
-            (ca, I, Cmd::ImageSize),
-            (ca, C, Cmd::CanvasSize),
-            (cmd, Z, Cmd::Undo),
-            (cmd, Y, Cmd::Redo),
-            (cmd, N, Cmd::New),
-            (cmd, O, Cmd::Open),
-            (cmd, S, Cmd::Save),
-            (cmd, W, Cmd::Close),
-            (cmd, Q, Cmd::Quit),
-            (cmd, A, Cmd::SelectAll),
-            (cmd, D, Cmd::Deselect),
-            (cmd, X, Cmd::Cut),
-            (cmd, C, Cmd::Copy),
-            (cmd, V, Cmd::Paste),
-            (cmd, J, Cmd::DuplicateOrViaCopy),
-            (cmd, E, Cmd::MergeDown),
-            (cmd, T, Cmd::Transform),
-            (cmd, L, Cmd::Adjust(1)),
-            (cmd, M, Cmd::Adjust(2)),
-            (cmd, U, Cmd::Adjust(5)),
-            (cmd, B, Cmd::Adjust(6)),
-            (cmd, I, Cmd::Adjust(10)),
-            (cmd, F, Cmd::RepeatFilter),
-            (cmd, CloseBracket, Cmd::LayerUp),
-            (cmd, OpenBracket, Cmd::LayerDown),
-            (cmd, Plus, Cmd::ZoomIn),
-            (cmd, Equals, Cmd::ZoomIn),
-            (cmd, Minus, Cmd::ZoomOut),
-            (cmd, Num0, Cmd::Fit),
-            (cmd, Num1, Cmd::ActualPixels),
-            (cmd, Backspace, Cmd::FillBg),
-            (Modifiers::ALT, Backspace, Cmd::FillFg),
-            (Modifiers::NONE, Delete, Cmd::Clear),
-            (cs, Slash, Cmd::Shortcuts),
-        ];
-        let wants_kb = ctx.wants_keyboard_input();
-        if wants_kb {
-            return;
-        }
-        let mut fired = Vec::new();
-        ctx.input_mut(|i| {
-            for (m, k, c) in table {
-                if i.consume_shortcut(&KeyboardShortcut::new(m, k)) {
-                    fired.push(c);
-                }
-            }
-        });
-        for c in fired {
-            self.run(c, ctx);
-        }
-
-        // Single-key tool shortcuts and brush tweaks.
-        let (pressed, mods): (Vec<Key>, Modifiers) = ctx.input(|i| {
-            (
-                i.events
-                    .iter()
-                    .filter_map(|e| match e {
-                        egui::Event::Key { key, pressed: true, repeat: _, .. } => Some(*key),
-                        _ => None,
-                    })
-                    .collect(),
-                i.modifiers,
-            )
-        });
-        if mods.command {
-            return;
-        }
-        for key in pressed {
-            if let Some(t) = Tool::ALL.iter().find(|t| t.shortcut() == Some(key)) {
-                if self.tools.is_busy() {
-                    continue;
-                }
-                if *t == Tool::Marquee && mods.shift && self.tools.tool.is_selection() {
-                    self.tools.tool = if self.tools.tool == Tool::Marquee { Tool::EllipseMarquee } else { Tool::Marquee };
-                } else if !(*t == Tool::Marquee && self.tools.tool == Tool::EllipseMarquee) {
-                    self.tools.tool = *t;
-                }
-                continue;
-            }
-            match key {
-                Key::X => self.tools.swap_colors(),
-                Key::D => self.tools.reset_colors(),
-                Key::OpenBracket | Key::CloseBracket => {
-                    let up = key == Key::CloseBracket;
-                    if let Some(b) = self.tools.current_brush() {
-                        if mods.shift {
-                            b.hardness = (b.hardness + if up { 0.25 } else { -0.25 }).clamp(0.0, 1.0);
-                        } else {
-                            let step = (b.size * 0.15).max(1.0);
-                            b.size = (b.size + if up { step } else { -step }).clamp(1.0, 2000.0).round();
-                        }
-                    }
-                }
-                Key::Num1 | Key::Num2 | Key::Num3 | Key::Num4 | Key::Num5 | Key::Num6 | Key::Num7 | Key::Num8 | Key::Num9 | Key::Num0 => {
-                    let n = match key {
-                        Key::Num0 => 10,
-                        k => k.name().parse::<u32>().unwrap_or(10),
-                    };
-                    if let Some(b) = self.tools.current_brush() {
-                        b.opacity = n as f32 / 10.0;
-                    } else if matches!(self.tools.tool, Tool::Bucket | Tool::Gradient) {
-                        self.tools.fill_opacity = n as f32 / 10.0;
-                    }
-                }
-                Key::Backspace => {
-                    if mods.alt {
-                        self.run(Cmd::FillFg, ctx);
-                    } else {
-                        self.run(Cmd::Clear, ctx);
-                    }
-                }
-                Key::Slash => self.run(Cmd::ToggleLockAlpha, ctx),
-                Key::Enter => {
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        self.tools.apply_crop(tab);
-                    }
-                }
-                Key::Escape => {
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        self.tools.cancel(tab);
-                    }
-                }
-                Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown if self.tools.tool == Tool::Move => {
-                    let n = if mods.shift { 10 } else { 1 };
-                    let (dx, dy) = match key {
-                        Key::ArrowLeft => (-n, 0),
-                        Key::ArrowRight => (n, 0),
-                        Key::ArrowUp => (0, -n),
-                        _ => (0, n),
-                    };
-                    if let Some(tab) = self.tabs.get_mut(self.active) {
-                        self.tools.nudge(tab, dx, dy);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------- menus
-
-    fn menu_bar(&mut self, ui: &mut egui::Ui) {
-        let mut cmd: Option<Cmd> = None;
-        let has_doc = !self.tabs.is_empty();
-        let has_sel = self.tabs.get(self.active).is_some_and(|t| t.doc.selection().is_some());
-        let (can_undo, can_redo) = self
-            .tabs
-            .get(self.active)
-            .map_or((false, false), |t| (t.doc.history().can_undo(), t.doc.history().can_redo()));
-        let mut item = |ui: &mut egui::Ui, label: &str, sc: &str, c: Cmd, enabled: bool| {
-            if ui.add_enabled(enabled, egui::Button::new(label).shortcut_text(sc)).clicked() {
-                cmd = Some(c);
-                ui.close_menu();
-            }
-        };
-        egui::menu::bar(ui, |ui| {
-            ui.menu_button("File", |ui| {
-                item(ui, "New…", "Ctrl+N", Cmd::New, true);
-                item(ui, "Open…", "Ctrl+O", Cmd::Open, true);
-                item(ui, "Place Embedded…", "", Cmd::Place, has_doc);
-                ui.separator();
-                item(ui, "Close", "Ctrl+W", Cmd::Close, has_doc);
-                item(ui, "Save", "Ctrl+S", Cmd::Save, has_doc);
-                item(ui, "Save As…", "Shift+Ctrl+S", Cmd::SaveAs, has_doc);
-                item(ui, "Export As…", "Shift+Ctrl+E", Cmd::Export, has_doc);
-                ui.separator();
-                item(ui, "Exit", "Ctrl+Q", Cmd::Quit, true);
-            });
-            ui.menu_button("Edit", |ui| {
-                let undo_label = self.tabs.get(self.active).filter(|_| can_undo).map(|t| format!("Undo {}", t.doc.history().current().label)).unwrap_or("Undo".into());
-                item(ui, &undo_label, "Ctrl+Z", Cmd::Undo, can_undo);
-                item(ui, "Redo", "Shift+Ctrl+Z", Cmd::Redo, can_redo);
-                ui.separator();
-                item(ui, "Cut", "Ctrl+X", Cmd::Cut, has_doc);
-                item(ui, "Copy", "Ctrl+C", Cmd::Copy, has_doc);
-                item(ui, "Copy Merged", "Shift+Ctrl+C", Cmd::CopyMerged, has_doc);
-                item(ui, "Paste", "Ctrl+V", Cmd::Paste, self.clipboard.is_some());
-                item(ui, "Clear", "Del", Cmd::Clear, has_doc);
-                ui.separator();
-                item(ui, "Fill…", "", Cmd::FillDialog, has_doc);
-                item(ui, "Stroke…", "", Cmd::Stroke, has_sel);
-                ui.separator();
-                item(ui, "Free Transform…", "Ctrl+T", Cmd::Transform, has_doc);
-            });
-            ui.menu_button("Image", |ui| {
-                ui.menu_button("Adjustments", |ui| {
-                    for (i, (label, sc)) in ADJUSTMENTS.iter().enumerate() {
-                        if i == 3 || i == 7 || i == 10 || i == 13 {
-                            ui.separator();
-                        }
-                        item(ui, label, sc, Cmd::Adjust(i), has_doc);
-                    }
-                });
-                item(ui, "Auto Contrast", "Shift+Ctrl+L", Cmd::AutoContrast, has_doc);
-                ui.separator();
-                item(ui, "Image Size…", "Alt+Ctrl+I", Cmd::ImageSize, has_doc);
-                item(ui, "Canvas Size…", "Alt+Ctrl+C", Cmd::CanvasSize, has_doc);
-                ui.menu_button("Image Rotation", |ui| {
-                    for o in [Orientation::Rotate180, Orientation::Rotate90Cw, Orientation::Rotate90Ccw, Orientation::FlipHorizontal, Orientation::FlipVertical] {
-                        item(ui, o.name(), "", Cmd::Orient(o), has_doc);
-                    }
-                });
-                item(ui, "Crop to Selection", "", Cmd::CropToSelection, has_sel);
-                item(ui, "Trim Transparent", "", Cmd::Trim, has_doc);
-                ui.separator();
-                item(ui, "Flatten Image", "", Cmd::Flatten, has_doc);
-            });
-            ui.menu_button("Layer", |ui| {
-                item(ui, "New Layer", "Shift+Ctrl+N", Cmd::NewLayer, has_doc);
-                item(ui, if has_sel { "Layer via Copy" } else { "Duplicate Layer" }, "Ctrl+J", Cmd::DuplicateOrViaCopy, has_doc);
-                item(ui, "Delete Layer", "", Cmd::DeleteLayer, has_doc);
-                ui.separator();
-                ui.menu_button("Layer Mask", |ui| {
-                    item(ui, "Reveal All", "", Cmd::AddMask, has_doc);
-                    item(ui, "Reveal Selection", "", Cmd::MaskFromSelection, has_sel);
-                    item(ui, "Delete", "", Cmd::DeleteMask, has_doc);
-                    item(ui, "Apply", "", Cmd::ApplyMask, has_doc);
-                });
-                ui.menu_button("Arrange", |ui| {
-                    item(ui, "Bring to Front", "Shift+Ctrl+]", Cmd::LayerTop, has_doc);
-                    item(ui, "Bring Forward", "Ctrl+]", Cmd::LayerUp, has_doc);
-                    item(ui, "Send Backward", "Ctrl+[", Cmd::LayerDown, has_doc);
-                    item(ui, "Send to Back", "Shift+Ctrl+[", Cmd::LayerBottom, has_doc);
-                });
-                item(ui, "Lock Transparent Pixels", "/", Cmd::ToggleLockAlpha, has_doc);
-                ui.separator();
-                item(ui, "Merge Down", "Ctrl+E", Cmd::MergeDown, has_doc);
-                item(ui, "Stamp Visible", "Alt+Shift+Ctrl+E", Cmd::StampVisible, has_doc);
-                item(ui, "Flatten Image", "", Cmd::Flatten, has_doc);
-            });
-            ui.menu_button("Select", |ui| {
-                item(ui, "All", "Ctrl+A", Cmd::SelectAll, has_doc);
-                item(ui, "Deselect", "Ctrl+D", Cmd::Deselect, has_sel);
-                item(ui, "Inverse", "Shift+Ctrl+I", Cmd::Inverse, has_sel);
-                item(ui, "Load Layer Transparency", "Ctrl+click thumb", Cmd::SelectionFromAlpha, has_doc);
-                ui.separator();
-                ui.menu_button("Modify", |ui| {
-                    use dialogs::SelModifyKind::*;
-                    item(ui, "Border…", "", Cmd::SelModify(Border), has_sel);
-                    item(ui, "Expand…", "", Cmd::SelModify(Expand), has_sel);
-                    item(ui, "Contract…", "", Cmd::SelModify(Contract), has_sel);
-                    item(ui, "Feather…", "Shift+F6", Cmd::SelModify(Feather), has_sel);
-                });
-            });
-            ui.menu_button("Filter", |ui| {
-                let last = self.last_filter.as_ref().map(|f| format!("Last Filter ({})", f.name())).unwrap_or("Last Filter".into());
-                item(ui, &last, "Ctrl+F", Cmd::RepeatFilter, has_doc && self.last_filter.is_some());
-                ui.separator();
-                let mut groups: Vec<&str> = Vec::new();
-                for (g, _) in FILTERS {
-                    if !groups.contains(&g) {
-                        groups.push(g);
-                    }
-                }
-                for g in groups {
-                    ui.menu_button(g, |ui| {
-                        for (i, (fg, label)) in FILTERS.iter().enumerate() {
-                            if *fg == g {
-                                item(ui, label, "", Cmd::Filter(i), has_doc);
-                            }
-                        }
-                    });
-                }
-            });
-            ui.menu_button("View", |ui| {
-                item(ui, "Zoom In", "Ctrl++", Cmd::ZoomIn, has_doc);
-                item(ui, "Zoom Out", "Ctrl+-", Cmd::ZoomOut, has_doc);
-                item(ui, "Fit on Screen", "Ctrl+0", Cmd::Fit, has_doc);
-                item(ui, "100%", "Ctrl+1", Cmd::ActualPixels, has_doc);
-            });
-            ui.menu_button("Window", |ui| {
-                ui.checkbox(&mut self.show_color, "Color");
-                ui.checkbox(&mut self.show_histogram, "Histogram");
-                ui.checkbox(&mut self.show_layers, "Layers");
-                ui.checkbox(&mut self.show_history, "History");
-            });
-            ui.menu_button("Help", |ui| {
-                item(ui, "Keyboard Shortcuts", "Shift+Ctrl+/", Cmd::Shortcuts, true);
-                item(ui, "About Forge Design", "", Cmd::About, true);
-            });
-        });
-        if let Some(c) = cmd {
-            let ctx = ui.ctx().clone();
-            self.run(c, &ctx);
         }
     }
 
@@ -969,6 +434,24 @@ impl ForgeApp {
                 let (tab, quit) = (*tab, *quit);
                 self.confirm_close(ctx, tab, quit)
             }
+            Dialog::Recovery(files) => {
+                let files = files.clone();
+                self.recovery(ctx, &files)
+            }
+            Dialog::Batch(d) => {
+                let r = d.show(ctx, &self.recorder);
+                if let Some((ai, input, output, ext)) = d.run.take() {
+                    if let Some(action) = self.recorder.actions.get(ai).cloned() {
+                        let (n, errors) = crate::actions::batch(self, &action, &input, &output, &ext, ctx);
+                        d.result = Some(if errors.is_empty() {
+                            format!("Processed {n} file(s).")
+                        } else {
+                            format!("Processed {n} file(s), {} error(s):\n{}", errors.len(), errors.join("\n"))
+                        });
+                    }
+                }
+                r
+            }
             other => {
                 let Some(tab) = self.tabs.get_mut(self.active) else {
                     return;
@@ -976,13 +459,30 @@ impl ForgeApp {
                 match other {
                     Dialog::ImageSize(d) => d.show(ctx, tab),
                     Dialog::CanvasSize(d) => d.show(ctx, tab),
-                    Dialog::Adjust(d) => d.show(ctx, tab, &self.tools),
-                    Dialog::Filter(d) => d.show(ctx, tab, &self.tools, &mut self.last_filter),
+                    Dialog::Adjust(d) => {
+                        let r = d.show(ctx, tab, &self.tools);
+                        if d.committed && self.recorder.recording {
+                            self.recorder.push(crate::actions::ActionStep::Adjust(d.adj.clone()));
+                        }
+                        r
+                    }
+                    Dialog::Filter(d) => {
+                        let r = d.show(ctx, tab, &self.tools, &mut self.last_filter);
+                        if d.committed && self.recorder.recording {
+                            self.recorder.push(crate::actions::ActionStep::Filter(d.filter.clone()));
+                        }
+                        r
+                    }
                     Dialog::Transform(d) => d.show(ctx, tab),
                     Dialog::Text(d) => d.show(ctx, tab, &mut self.tools, &self.fonts),
                     Dialog::Fill(d) => d.show(ctx, tab, &self.tools),
                     Dialog::Stroke(d) => d.show(ctx, tab),
                     Dialog::SelModify(d) => d.show(ctx, tab),
+                    Dialog::LayerStyle(d) => d.show(ctx, tab),
+                    Dialog::ColorRange(d) => d.show(ctx, tab),
+                    Dialog::FocusArea(d) => d.show(ctx, tab),
+                    Dialog::NewGuide(d) => d.show(ctx, tab),
+                    Dialog::Animation(d) => d.show(ctx, tab),
                     _ => Outcome::Close,
                 }
             }
@@ -996,6 +496,38 @@ impl ForgeApp {
             Outcome::Close => {}
             Outcome::NewDocument(doc) => self.add_tab(doc),
         }
+    }
+
+    fn recovery(&mut self, ctx: &egui::Context, files: &[PathBuf]) -> Outcome {
+        let mut out = Outcome::Open;
+        egui::Window::new("Recover Documents")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("Forge Design found {} unsaved document(s) from a previous session.", files.len()));
+                ui.horizontal(|ui| {
+                    if ui.button("Recover").clicked() {
+                        for f in files {
+                            if let Ok(mut d) = forge_io::open(f) {
+                                d.path = None;
+                                d.name = "Recovered".into();
+                                d.commit("Recovered");
+                                self.add_tab(d);
+                            }
+                            let _ = std::fs::remove_file(f);
+                        }
+                        out = Outcome::Close;
+                    }
+                    if ui.button("Discard").clicked() {
+                        for f in files {
+                            let _ = std::fs::remove_file(f);
+                        }
+                        out = Outcome::Close;
+                    }
+                });
+            });
+        out
     }
 
     fn confirm_close(&mut self, ctx: &egui::Context, tab: usize, quit: bool) -> Outcome {
@@ -1022,8 +554,7 @@ impl ForgeApp {
                     if close {
                         out = Outcome::Close;
                         if tab < self.tabs.len() {
-                            self.tabs.remove(tab);
-                            self.active = self.active.min(self.tabs.len().saturating_sub(1));
+                            self.close_tab(tab);
                         }
                         if quit {
                             self.continue_quit(ctx);
@@ -1046,39 +577,77 @@ impl ForgeApp {
     // -------------------------------------------------------------- panels
 
     fn right_panel(&mut self, ui: &mut egui::Ui) {
-        if self.show_color {
+        let ctx = ui.ctx().clone();
+        if self.panels.color {
             egui::CollapsingHeader::new("Color").default_open(true).show(ui, |ui| {
                 panels::color_panel(ui, &mut self.tools, self.editing_bg, &mut self.hex_buf);
             });
         }
+        if self.panels.swatches {
+            egui::CollapsingHeader::new("Swatches").default_open(true).show(ui, |ui| {
+                panels::swatches_panel(ui, &mut self.tools, &mut self.swatches);
+            });
+        }
+        if self.panels.brushes {
+            egui::CollapsingHeader::new("Brushes").default_open(true).show(ui, |ui| {
+                panels::brushes_panel(ui, &mut self.tools, &mut self.brush_presets);
+            });
+        }
+        if self.panels.actions {
+            let mut play = None;
+            egui::CollapsingHeader::new("Actions").default_open(true).show(ui, |ui| {
+                play = panels::actions_panel(ui, &mut self.recorder);
+            });
+            if let Some(i) = play {
+                if let Some(a) = self.recorder.actions.get(i).cloned() {
+                    crate::actions::play(self, &a, &ctx);
+                }
+            }
+        }
         let Some(tab) = self.tabs.get_mut(self.active) else { return };
-        if self.show_histogram {
+        if self.panels.navigator {
+            egui::CollapsingHeader::new("Navigator").default_open(true).show(ui, |ui| panels::navigator_panel(ui, tab));
+        }
+        if self.panels.info {
+            egui::CollapsingHeader::new("Info").default_open(true).show(ui, |ui| panels::info_panel(ui, tab, &self.tools));
+        }
+        if self.panels.histogram {
             egui::CollapsingHeader::new("Histogram").default_open(true).show(ui, |ui| panels::histogram_panel(ui, tab));
         }
-        if self.show_history {
+        if self.panels.properties {
+            egui::CollapsingHeader::new("Properties").default_open(true).show(ui, |ui| {
+                panels::properties_panel(ui, tab, &self.fonts);
+            });
+        }
+        if self.panels.history {
             egui::CollapsingHeader::new("History").default_open(true).show(ui, |ui| {
-                ui.set_max_height(150.0);
+                ui.set_max_height(140.0);
                 panels::history_panel(ui, tab);
             });
         }
+        if self.panels.paths {
+            egui::CollapsingHeader::new("Paths").default_open(true).show(ui, |ui| {
+                panels::paths_panel(ui, tab, &self.tools);
+            });
+        }
         let mut action = None;
-        if self.show_layers {
+        if self.panels.layers {
             egui::CollapsingHeader::new("Layers").default_open(true).show(ui, |ui| {
                 action = panels::layers_panel(ui, tab, &mut self.layers_ui);
             });
         }
-        let ctx = ui.ctx().clone();
         match action {
-            Some(LayerAction::New) => self.run(Cmd::NewLayer, &ctx),
-            Some(LayerAction::Duplicate) => self.run(Cmd::DuplicateOrViaCopy, &ctx),
-            Some(LayerAction::Delete) => self.run(Cmd::DeleteLayer, &ctx),
-            Some(LayerAction::AddMask) => self.run(if self.tabs[self.active].doc.selection().is_some() { Cmd::MaskFromSelection } else { Cmd::AddMask }, &ctx),
-            Some(LayerAction::MergeDown) => self.run(Cmd::MergeDown, &ctx),
-            Some(LayerAction::Up) => self.run(Cmd::LayerUp, &ctx),
-            Some(LayerAction::Down) => self.run(Cmd::LayerDown, &ctx),
+            Some(LayerAction::Cmd(c)) => self.run(c, &ctx),
             Some(LayerAction::SelectionFromAlpha(i)) => {
                 if let Some(tab) = self.tabs.get_mut(self.active) {
-                    selection_from_alpha(tab, i);
+                    crate::commands::selection_from_alpha(tab, i);
+                }
+            }
+            Some(LayerAction::EditText(i)) => {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    if let Some(d) = dialogs::TextDialog::edit(tab, i) {
+                        self.dialog = Some(Dialog::Text(Box::new(d)));
+                    }
                 }
             }
             None => {}
@@ -1087,6 +656,10 @@ impl ForgeApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            if self.recorder.recording {
+                ui.label(RichText::new("● REC").color(Color32::from_rgb(240, 70, 70)));
+                ui.separator();
+            }
             if let Some(tab) = self.tabs.get(self.active) {
                 ui.label(format!("{:.1}%", tab.view.zoom * 100.0));
                 ui.separator();
@@ -1096,10 +669,6 @@ impl ForgeApp {
                     let (x, y) = (p.x.floor() as i32, p.y.floor() as i32);
                     if tab.doc.state.bounds().contains(x, y) {
                         ui.label(format!("X: {x}  Y: {y}"));
-                        let px = composite::composite_rect(&tab.doc.state, IRect::new(x, y, x + 1, y + 1), composite::Background::Transparent)[0];
-                        let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
-                        ui.painter().rect_filled(rect, 2.0, Color32::from_rgba_unmultiplied(px[0], px[1], px[2], px[3]));
-                        ui.label(format!("R {} G {} B {} A {}", px[0], px[1], px[2], px[3]));
                         ui.separator();
                     }
                 }
@@ -1110,7 +679,7 @@ impl ForgeApp {
                     .iter()
                     .map(|l| l.pixels.allocated_tiles() + l.mask.as_ref().map_or(0, |m| m.allocated_tiles() / 4))
                     .sum();
-                ui.label(format!("Layers: {:.1} MB", tiles as f64 * 16.0 / 1024.0));
+                ui.label(format!("Doc: {:.1} MB", tiles as f64 * 16.0 / 1024.0));
                 if tab.doc.state.editing_mask {
                     ui.separator();
                     ui.label(RichText::new("Editing layer mask").color(Color32::from_rgb(255, 200, 80)));
@@ -1149,25 +718,6 @@ impl ForgeApp {
     }
 }
 
-fn apply_filter_now(tab: &mut DocTab, f: &Filter) {
-    let i = tab.doc.state.active;
-    let base = tab.doc.state.layers[i].pixels.clone();
-    let sel = tab.doc.state.selection.clone();
-    if let Some(r) = forge_core::filters::apply(&mut tab.doc.state.layers[i].pixels, &base, sel.as_ref(), f) {
-        tab.doc.mark_dirty(r);
-        tab.doc.commit(f.name());
-    }
-}
-
-fn selection_from_alpha(tab: &mut DocTab, i: usize) {
-    let Some(l) = tab.doc.state.layers.get(i) else { return };
-    let (w, h) = (tab.doc.width(), tab.doc.height());
-    let px = &l.pixels;
-    let m = Mask::from_fn_par(w, h, 0, |x, y| px.get(x, y)[3]);
-    tab.doc.set_selection(m.content_bounds().map(|_| m));
-    tab.doc.commit("Load Selection");
-}
-
 impl eframe::App for ForgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Files dropped onto the window.
@@ -1191,10 +741,37 @@ impl eframe::App for ForgeApp {
                 if self.dialog.is_none() {
                     self.continue_quit(ctx);
                 }
+            } else {
+                let _ = std::fs::remove_dir_all(recovery_dir());
             }
         }
 
         self.handle_shortcuts(ctx);
+        self.autosave();
+
+        // Text tool clicked: open the type dialog (new or re-edit).
+        if let Some((p, hit)) = self.tools.text_request.take() {
+            if self.dialog.is_none() {
+                if let Some(tab) = self.tabs.get_mut(self.active) {
+                    let d = match hit {
+                        Some(i) => dialogs::TextDialog::edit(tab, i),
+                        None => {
+                            let mut data = self.tools.text.clone();
+                            data.color = self.tools.fg;
+                            data.vertical = self.tools.tool == crate::tools::Tool::VerticalText;
+                            if let Some(f) = self.fonts.get(self.tools.font_index) {
+                                data.font_name = f.name.clone();
+                                data.font_path = f.path.as_ref().map(|p| p.to_string_lossy().to_string());
+                            }
+                            Some(dialogs::TextDialog::create(tab, p, data))
+                        }
+                    };
+                    if let Some(d) = d {
+                        self.dialog = Some(Dialog::Text(Box::new(d)));
+                    }
+                }
+            }
+        }
 
         // Window title.
         let title = match self.tabs.get(self.active) {
@@ -1212,13 +789,15 @@ impl eframe::App for ForgeApp {
             self.tools.options_ui(ui, &self.fonts, tab);
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| self.status_bar(ui));
-        egui::SidePanel::left("tools").resizable(false).exact_width(84.0).show(ctx, |ui| {
-            ui.add_space(4.0);
-            panels::toolbar(ui, &mut self.tools, &mut self.editing_bg);
-        });
-        egui::SidePanel::right("panels").default_width(290.0).min_width(240.0).show(ctx, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.right_panel(ui));
-        });
+        if !self.hide_panels {
+            egui::SidePanel::left("tools").resizable(false).exact_width(84.0).show(ctx, |ui| {
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().show(ui, |ui| panels::toolbar(ui, &mut self.tools, &mut self.editing_bg));
+            });
+            egui::SidePanel::right("panels").default_width(300.0).min_width(250.0).show(ctx, |ui| {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| self.right_panel(ui));
+            });
+        }
 
         egui::CentralPanel::default().frame(egui::Frame::none().fill(INK)).show(ctx, |ui| {
             if self.tabs.is_empty() {
@@ -1227,11 +806,11 @@ impl eframe::App for ForgeApp {
             }
             // Document tabs.
             let mut close = None;
-            egui::Frame::none().fill(Color32::from_gray(45)).inner_margin(egui::Margin::symmetric(4.0, 2.0)).show(ui, |ui| {
+            egui::Frame::none().fill(Color32::from_rgb(34, 33, 39)).inner_margin(egui::Margin::symmetric(4.0, 2.0)).show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (i, t) in self.tabs.iter().enumerate() {
                         let selected = i == self.active;
-                        if ui.selectable_label(selected, t.title()).clicked() {
+                        if ui.selectable_label(selected, t.title()).clicked() && !self.tools.is_busy() && self.tools.transform.is_none() {
                             self.active = i;
                         }
                         if ui.small_button("×").on_hover_text("Close").clicked() {
@@ -1249,31 +828,32 @@ impl eframe::App for ForgeApp {
             }
         });
 
-        if let Some(p) = self.tools.text_request.take() {
-            if self.dialog.is_none() {
-                self.dialog = Some(Dialog::Text(dialogs::TextDialog { pos: p, text: String::new() }));
-            }
-        }
         self.dialogs(ctx);
     }
 }
 
-fn setup_style(ctx: &egui::Context) {
-    let mut v = egui::Visuals::dark();
-    v.panel_fill = Color32::from_rgb(34, 33, 39);
-    v.window_fill = Color32::from_rgb(38, 37, 44);
-    v.extreme_bg_color = INK;
-    v.faint_bg_color = Color32::from_rgb(44, 43, 50);
-    v.selection.bg_fill = ACCENT_DIM;
-    v.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
-    v.hyperlink_color = ACCENT;
-    v.widgets.noninteractive.bg_fill = Color32::from_rgb(34, 33, 39);
-    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, PAPER.gamma_multiply(0.8));
-    v.widgets.inactive.bg_fill = Color32::from_rgb(52, 51, 59);
-    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(48, 47, 55);
-    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, PAPER);
-    v.widgets.hovered.bg_fill = Color32::from_rgb(66, 65, 74);
-    v.widgets.active.bg_fill = ACCENT_DIM;
+pub fn setup_style(ctx: &egui::Context, light: bool) {
+    let mut v = if light { egui::Visuals::light() } else { egui::Visuals::dark() };
+    if light {
+        v.selection.bg_fill = Color32::from_rgb(170, 210, 60);
+        v.selection.stroke = egui::Stroke::new(1.0_f32, Color32::BLACK);
+        v.hyperlink_color = Color32::from_rgb(70, 110, 10);
+    } else {
+        v.panel_fill = Color32::from_rgb(34, 33, 39);
+        v.window_fill = Color32::from_rgb(38, 37, 44);
+        v.extreme_bg_color = INK;
+        v.faint_bg_color = Color32::from_rgb(44, 43, 50);
+        v.selection.bg_fill = ACCENT_DIM;
+        v.selection.stroke = egui::Stroke::new(1.0_f32, ACCENT);
+        v.hyperlink_color = ACCENT;
+        v.widgets.noninteractive.bg_fill = Color32::from_rgb(34, 33, 39);
+        v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, PAPER.gamma_multiply(0.8));
+        v.widgets.inactive.bg_fill = Color32::from_rgb(52, 51, 59);
+        v.widgets.inactive.weak_bg_fill = Color32::from_rgb(48, 47, 55);
+        v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, PAPER);
+        v.widgets.hovered.bg_fill = Color32::from_rgb(66, 65, 74);
+        v.widgets.active.bg_fill = ACCENT_DIM;
+    }
     v.window_rounding = egui::Rounding::same(4.0);
     ctx.set_visuals(v);
     let mut style = (*ctx.style()).clone();

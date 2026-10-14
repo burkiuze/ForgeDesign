@@ -57,6 +57,16 @@ fn forge_attrs(layer: &Layer, xml: &mut String) {
             xml.push_str(&format!(" forge:style=\"{}\"", escape(&json)));
         }
     }
+    if let Some(adj) = layer.adjustment.as_ref().filter(|_| layer.is_adjustment()) {
+        if let Ok(json) = serde_json::to_string(adj) {
+            xml.push_str(&format!(" forge:adjustment=\"{}\"", escape(&json)));
+        }
+    }
+    if let Some(text) = &layer.text {
+        if let Ok(json) = serde_json::to_string(text) {
+            xml.push_str(&format!(" forge:text=\"{}\"", escape(&json)));
+        }
+    }
 }
 
 fn write_stack(
@@ -113,6 +123,22 @@ fn write_stack(
             xml.push_str(" edit-locked=\"true\"");
         }
         forge_attrs(layer, xml);
+        if let Some(smart) = &layer.smart {
+            let ssrc = format!("data/smart{i}.png");
+            let b = smart.source.content_bounds().unwrap_or(IRect::new(0, 0, 1, 1));
+            let data = png_rgba(&smart.source.region_to_dense(b), b.width() as u32, b.height() as u32)?;
+            zip.start_file(&ssrc, stored)?;
+            zip.write_all(&data)?;
+            let filters = serde_json::to_string(&smart.filters).unwrap_or_default();
+            let quad = serde_json::to_string(&smart.quad).unwrap_or_default();
+            xml.push_str(&format!(
+                " forge:smart=\"{ssrc}\" forge:smart-x=\"{}\" forge:smart-y=\"{}\" forge:smart-quad=\"{}\" forge:smart-filters=\"{}\"",
+                b.x0,
+                b.y0,
+                escape(&quad),
+                escape(&filters)
+            ));
+        }
         if let Some(mask) = &layer.mask {
             let msrc = format!("data/mask{i}.png");
             let data = png_gray(&mask.to_dense(), w, h)?;
@@ -191,6 +217,11 @@ fn read_common(node: roxmltree::Node, layer: &mut Layer) {
     layer.clipped = node.attribute((FORGE_NS, "clipped")) == Some("true");
     layer.label = node.attribute((FORGE_NS, "label")).and_then(|v| v.parse().ok()).unwrap_or(0);
     layer.style = node.attribute((FORGE_NS, "style")).and_then(|v| serde_json::from_str(v).ok());
+    layer.text = node.attribute((FORGE_NS, "text")).and_then(|v| serde_json::from_str(v).ok());
+    if let Some(adj) = node.attribute((FORGE_NS, "adjustment")).and_then(|v| serde_json::from_str(v).ok()) {
+        layer.kind = forge_core::layer::LayerKind::Adjustment;
+        layer.adjustment = Some(adj);
+    }
 }
 
 /// Reads the children of a `<stack>` (top-most first) into `state`, bottom-first.
@@ -230,6 +261,20 @@ fn read_stack(
                 layer.lock_alpha = node.attribute((FORGE_NS, "lock-alpha")) == Some("true");
                 layer.locked = node.attribute("edit-locked") == Some("true");
                 layer.parent = parent;
+                if let Some(ssrc) = node.attribute((FORGE_NS, "smart")) {
+                    let data = read_entry(zip, ssrc)?;
+                    let img = decode_image(&data)?;
+                    let sx = node.attribute((FORGE_NS, "smart-x")).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let sy = node.attribute((FORGE_NS, "smart-y")).and_then(|v| v.parse().ok()).unwrap_or(0);
+                    let mut so = forge_core::layer::SmartObject::new(forge_core::transform::translate(&img, sx, sy, w, h));
+                    if let Some(q) = node.attribute((FORGE_NS, "smart-quad")).and_then(|v| serde_json::from_str(v).ok()) {
+                        so.quad = q;
+                    }
+                    if let Some(f) = node.attribute((FORGE_NS, "smart-filters")).and_then(|v| serde_json::from_str(v).ok()) {
+                        so.filters = f;
+                    }
+                    layer.smart = Some(Box::new(so));
+                }
                 if let Some(msrc) = node.attribute((FORGE_NS, "mask")) {
                     let data = read_entry(zip, msrc)?;
                     layer.mask = Some(decode_gray(&data, w, h, 255)?);

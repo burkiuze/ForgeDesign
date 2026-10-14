@@ -613,6 +613,40 @@ pub fn warp_pixels(base: &TiledBuffer<Rgba8>, sel: Option<&Mask>, grid: &[(f32, 
     map_pixels(base, sel, b, &corners, Resample::Bilinear, inv)
 }
 
+/// Perspective Crop: maps the quad (TL, TR, BR, BL) to a rectangle and
+/// makes that the new canvas.
+pub fn perspective_crop(state: &mut DocState, quad: [(f32, f32); 4]) {
+    let d = |a: (f32, f32), b: (f32, f32)| ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt();
+    let nw = ((d(quad[0], quad[1]) + d(quad[3], quad[2])) * 0.5).round().max(1.0) as u32;
+    let nh = ((d(quad[0], quad[3]) + d(quad[1], quad[2])) * 0.5).round().max(1.0) as u32;
+    let rect = [(0.0, 0.0), (nw as f32, 0.0), (nw as f32, nh as f32), (0.0, nh as f32)];
+    let Some(hm) = Homography::from_quads(rect, quad) else { return };
+    state.layers.par_iter_mut().for_each(|l| {
+        let src = l.pixels.clone();
+        l.pixels = TiledBuffer::from_fn_par(nw, nh, [0, 0, 0, 0], |x, y| match hm.apply(x as f32 + 0.5, y as f32 + 0.5) {
+            Some((sx, sy)) => crate::brush::sample_bilinear(&src, sx, sy),
+            None => [0, 0, 0, 0],
+        });
+        if let Some(m) = &l.mask {
+            let m = m.clone();
+            l.mask = Some(TiledBuffer::from_fn_par(nw, nh, 255, |x, y| match hm.apply(x as f32 + 0.5, y as f32 + 0.5) {
+                Some((sx, sy)) => m.get(sx.floor() as i32, sy.floor() as i32),
+                None => 255,
+            }));
+        }
+    });
+    state.selection = None;
+    state.width = nw;
+    state.height = nh;
+}
+
+/// Rotates a layer's pixels by `deg` around the canvas centre
+/// (Ruler tool "Straighten Layer").
+pub fn rotate_layer(buf: &TiledBuffer<Rgba8>, deg: f32) -> TiledBuffer<Rgba8> {
+    let (cx, cy) = (buf.width() as f32 * 0.5, buf.height() as f32 * 0.5);
+    transform_pixels(buf, None, Affine::scale_rotate(cx, cy, 1.0, 1.0, deg, 0.0, 0.0), Resample::Bilinear).0
+}
+
 /// The identity warp grid for `bounds` (4×4 points evenly spaced).
 pub fn warp_identity_grid(b: IRect) -> [(f32, f32); 16] {
     std::array::from_fn(|k| {

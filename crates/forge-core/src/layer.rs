@@ -2,7 +2,11 @@
 
 use crate::blend::BlendMode;
 use crate::buffer::TiledBuffer;
-use crate::color::Rgba8;
+use serde::{Deserialize, Serialize};
+
+use crate::adjust::Adjustment;
+use crate::color::{Color, Rgba8};
+use crate::filters::Filter;
 use crate::styles::LayerStyle;
 
 pub type LayerId = u64;
@@ -16,6 +20,83 @@ pub enum LayerKind {
     Pixel,
     /// A folder; its children have `parent == Some(group.id)`.
     Group,
+    /// Non-destructive adjustment layer (see [`Layer::adjustment`]).
+    Adjustment,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// Editable text of a type layer (rasterised by the application).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TextData {
+    pub text: String,
+    /// Font file path; `None` = built-in font.
+    pub font_path: Option<String>,
+    pub font_name: String,
+    pub size: f32,
+    pub color: Color,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    /// Extra letter spacing in 1/1000 em (Photoshop tracking units).
+    pub tracking: f32,
+    /// Line spacing multiplier.
+    pub leading: f32,
+    pub align: TextAlign,
+    pub vertical: bool,
+    /// Paragraph text box width (wraps words); `None` = point text.
+    pub box_width: Option<f32>,
+    /// Arc warp, -100..100.
+    pub warp: f32,
+    pub x: f32,
+    pub y: f32,
+    pub antialias: bool,
+}
+
+/// Smart Object: the original pixels plus a non-destructive transform and
+/// smart filters. `Layer::pixels` holds the rendered result.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SmartObject {
+    pub source: TiledBuffer<Rgba8>,
+    /// Where the source bounds' corners (TL, TR, BR, BL) land.
+    pub quad: [(f32, f32); 4],
+    pub filters: Vec<SmartFilter>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SmartFilter {
+    pub filter: Filter,
+    pub enabled: bool,
+}
+
+impl SmartObject {
+    pub fn new(source: TiledBuffer<Rgba8>) -> Self {
+        let b = source.content_bounds().unwrap_or(source.bounds());
+        let quad = [(b.x0 as f32, b.y0 as f32), (b.x1 as f32, b.y0 as f32), (b.x1 as f32, b.y1 as f32), (b.x0 as f32, b.y1 as f32)];
+        Self { source, quad, filters: Vec::new() }
+    }
+
+    /// Re-renders the layer pixels from the source (quality never degrades).
+    pub fn render(&self) -> TiledBuffer<Rgba8> {
+        let b = self.source.content_bounds().unwrap_or(self.source.bounds());
+        let ident = [(b.x0 as f32, b.y0 as f32), (b.x1 as f32, b.y0 as f32), (b.x1 as f32, b.y1 as f32), (b.x0 as f32, b.y1 as f32)];
+        let mut px = if self.quad == ident {
+            self.source.clone()
+        } else {
+            crate::transform::transform_pixels_quad(&self.source, None, self.quad, crate::transform::Resample::Bilinear).0
+        };
+        for f in self.filters.iter().filter(|f| f.enabled) {
+            let base = px.clone();
+            crate::filters::apply(&mut px, &base, None, &f.filter);
+        }
+        px
+    }
 }
 
 /// Photoshop's layer colour labels.
@@ -57,6 +138,11 @@ pub struct Layer {
     pub collapsed: bool,
     /// Index into [`LABEL_COLORS`].
     pub label: u8,
+    /// For [`LayerKind::Adjustment`] layers.
+    pub adjustment: Option<Adjustment>,
+    /// Type layers keep their text editable.
+    pub text: Option<TextData>,
+    pub smart: Option<Box<SmartObject>>,
 }
 
 impl Layer {
@@ -79,7 +165,27 @@ impl Layer {
             parent: None,
             collapsed: false,
             label: 0,
+            adjustment: None,
+            text: None,
+            smart: None,
         }
+    }
+
+    pub fn new_adjustment(id: LayerId, adj: Adjustment, width: u32, height: u32) -> Self {
+        let mut l = Self::new(id, adj.name(), width, height);
+        l.kind = LayerKind::Adjustment;
+        l.adjustment = Some(adj);
+        l.add_mask();
+        l
+    }
+
+    pub fn is_adjustment(&self) -> bool {
+        self.kind == LayerKind::Adjustment
+    }
+
+    /// Pixel layers that tools may paint on (not groups/adjustments).
+    pub fn has_pixels(&self) -> bool {
+        self.kind == LayerKind::Pixel
     }
 
     pub fn new_group(id: LayerId, name: impl Into<String>, width: u32, height: u32) -> Self {
@@ -144,5 +250,7 @@ impl Layer {
             && self.style == o.style
             && self.kind == o.kind
             && self.parent == o.parent
+            && self.adjustment == o.adjustment
+            && self.label == o.label
     }
 }

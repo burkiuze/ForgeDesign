@@ -29,8 +29,10 @@ pub mod filters;
 pub mod geom;
 pub mod history;
 pub mod layer;
+pub mod paths;
 pub mod retouch;
 pub mod selection;
+pub mod shapes;
 pub mod styles;
 pub mod transform;
 

@@ -309,7 +309,7 @@ impl Filter {
                 out
             }
             Filter::LensBlur { radius } => {
-                let n = ((radius * radius * 3.14) as usize).clamp(8, 160);
+                let n = ((radius * radius * std::f32::consts::PI) as usize).clamp(8, 160);
                 let golden = std::f32::consts::PI * (3.0 - 5f32.sqrt());
                 let offsets: Vec<(f32, f32)> = (0..n)
                     .map(|i| {

@@ -122,7 +122,7 @@ pub fn content_aware_fill(target: &mut TiledBuffer<Rgba8>, base: &TiledBuffer<Rg
             d[k] -= l[k];
         }
     }
-    let (hx0, hy0) = ((hole.x0 - rect.x0) as i32, (hole.y0 - rect.y0) as i32);
+    let (hx0, hy0) = ((hole.x0 - rect.x0), (hole.y0 - rect.y0));
     let (hw, hh) = (hole.width(), hole.height());
     let mut candidates = Vec::new();
     for s in [1.0f32, 1.5, 2.0] {
@@ -191,6 +191,48 @@ pub fn content_aware_fill(target: &mut TiledBuffer<Rgba8>, base: &TiledBuffer<Rg
     let img = FImage { w, h, data: result };
     crate::filters::write_back(target, base, None, hole, rect, &img);
     Some(hole)
+}
+
+/// Patch Tool: replaces the selected area with texture from the area
+/// offset by `(dx, dy)`, matched to the destination's colour and lighting.
+pub fn patch(target: &mut TiledBuffer<Rgba8>, base: &TiledBuffer<Rgba8>, sel: &Mask, dx: i32, dy: i32) -> Option<IRect> {
+    let (fw, fh) = (base.width(), base.height());
+    let dst = sel.content_bounds()?;
+    let r = 6;
+    let region = dst.union(&dst.translate(dx, dy)).expand(r + 2).clamp_to(fw, fh);
+    let img = FImage::from_buffer(base, region);
+    let mut low = img.data.clone();
+    box_blur(&mut low, img.w, img.h, r as usize);
+    let at = |v: &Vec<Px>, x: i32, y: i32| -> Px {
+        let lx = (x - region.x0).clamp(0, region.width() - 1) as usize;
+        let ly = (y - region.y0).clamp(0, region.height() - 1) as usize;
+        v[ly * img.w + lx]
+    };
+    let out_rect = dst;
+    let ow = out_rect.width() as usize;
+    let data: Vec<Px> = (0..ow * out_rect.height() as usize)
+        .into_par_iter()
+        .map(|i| {
+            let (x, y) = (out_rect.x0 + (i % ow) as i32, out_rect.y0 + (i / ow) as i32);
+            let s = at(&img.data, x + dx, y + dy);
+            let ms = at(&low, x + dx, y + dy);
+            let md = at(&low, x, y);
+            let o = at(&img.data, x, y);
+            let mut p = [0.0; 4];
+            for k in 0..4 {
+                p[k] = s[k] - ms[k] + md[k];
+            }
+            p[3] = p[3].clamp(0.0, 1.0);
+            for k in 0..3 {
+                p[k] = p[k].clamp(0.0, p[3]);
+            }
+            let a = sel.get(x, y) as f32 / 255.0;
+            [0, 1, 2, 3].map(|k| o[k] + (p[k] - o[k]) * a)
+        })
+        .collect();
+    let out = FImage { w: ow, h: out_rect.height() as usize, data };
+    crate::filters::write_back(target, base, None, out_rect, out_rect, &out);
+    Some(out_rect)
 }
 
 #[cfg(test)]

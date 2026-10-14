@@ -22,11 +22,14 @@ pub struct DocState {
     pub next_id: LayerId,
     /// When true, painting tools target the active layer's mask.
     pub editing_mask: bool,
+    /// Vector paths (Paths panel).
+    pub paths: Vec<crate::paths::VectorPath>,
+    pub active_path: Option<usize>,
 }
 
 impl DocState {
     pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height, layers: Vec::new(), active: 0, selection: None, next_id: 1, editing_mask: false }
+        Self { width, height, layers: Vec::new(), active: 0, selection: None, next_id: 1, editing_mask: false, paths: Vec::new(), active_path: None }
     }
 
     pub fn alloc_id(&mut self) -> LayerId {

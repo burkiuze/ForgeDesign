@@ -229,56 +229,7 @@ pub fn gradient(
     Some(rect)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ShapeKind {
-    #[default]
-    Rectangle,
-    Ellipse,
-    Line,
-}
-
-impl ShapeKind {
-    pub const ALL: [ShapeKind; 3] = [ShapeKind::Rectangle, ShapeKind::Ellipse, ShapeKind::Line];
-    pub fn name(self) -> &'static str {
-        match self {
-            ShapeKind::Rectangle => "Rectangle",
-            ShapeKind::Ellipse => "Ellipse",
-            ShapeKind::Line => "Line",
-        }
-    }
-}
-
-/// Coverage mask of a shape dragged from `a` to `b`.
-pub fn shape_mask(w: u32, h: u32, kind: ShapeKind, a: Point, b: Point, line_width: f32) -> Mask {
-    match kind {
-        ShapeKind::Rectangle => selection::polygon_mask(
-                w,
-                h,
-                &[
-                    Point::new(a.x.min(b.x), a.y.min(b.y)),
-                    Point::new(a.x.max(b.x), a.y.min(b.y)),
-                    Point::new(a.x.max(b.x), a.y.max(b.y)),
-                    Point::new(a.x.min(b.x), a.y.max(b.y)),
-                ],
-            ),
-        ShapeKind::Ellipse => selection::ellipse_mask(w, h, IRect::from_points(a, b)),
-        ShapeKind::Line => {
-            let (dx, dy) = (b.x - a.x, b.y - a.y);
-            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
-            let (nx, ny) = (-dy / len * line_width * 0.5, dx / len * line_width * 0.5);
-            selection::polygon_mask(
-                w,
-                h,
-                &[
-                    Point::new(a.x + nx, a.y + ny),
-                    Point::new(b.x + nx, b.y + ny),
-                    Point::new(b.x - nx, b.y - ny),
-                    Point::new(a.x - nx, a.y - ny),
-                ],
-            )
-        }
-    }
-}
+pub use crate::shapes::{shape_mask, ShapeKind, ShapeParams};
 
 /// Outline ("Edit > Stroke") of the selection, `width` pixels, centred on the edge.
 pub fn stroke_selection_mask(sel: &Mask, width: f32) -> Mask {

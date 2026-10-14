@@ -135,7 +135,7 @@ fn order<'a>(state: &'a DocState, parent: Option<u64>, out: &mut Vec<Entry<'a>>)
                 blend: l.blend,
                 clipped: false,
             });
-        } else {
+        } else if l.has_pixels() {
             out.push(Entry { layer: Some(l), name: l.name.clone(), section: 0, opacity: l.opacity * l.fill, visible: l.visible, blend: l.blend, clipped: l.clipped });
         }
     }
@@ -260,7 +260,7 @@ pub fn write_psd(state: &DocState) -> Result<Vec<u8>> {
         for c in &utf16 {
             luni.u16(*c);
         }
-        if luni.0.len() % 4 != 0 {
+        if !luni.0.len().is_multiple_of(4) {
             luni.bytes(&vec![0; 4 - luni.0.len() % 4]);
         }
         extra.bytes(b"8BIMluni");
@@ -279,7 +279,7 @@ pub fn write_psd(state: &DocState) -> Result<Vec<u8>> {
     }
     let mut layer_info = records.0;
     layer_info.extend_from_slice(&chan_data.0);
-    if layer_info.len() % 2 != 0 {
+    if !layer_info.len().is_multiple_of(2) {
         layer_info.push(0);
     }
     f.u32((4 + layer_info.len() + 4) as u32);

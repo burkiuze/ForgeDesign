@@ -123,5 +123,140 @@ pub fn draw(p: &Painter, r: Rect, tool: Tool, col: Color32) {
             p.circle_stroke(at(-0.2, -0.2), s * 0.6, st);
             p.line_segment([at(0.25, 0.25), at(0.95, 0.95)], Stroke::new(2.4_f32, col));
         }
+        Tool::RowMarquee => {
+            p.extend(Shape::dashed_line(&[at(-1.0, 0.0), at(1.0, 0.0)], st, 3.0, 2.5));
+            p.line_segment([at(-1.0, -0.4), at(-1.0, 0.4)], thin);
+            p.line_segment([at(1.0, -0.4), at(1.0, 0.4)], thin);
+        }
+        Tool::ColumnMarquee => {
+            p.extend(Shape::dashed_line(&[at(0.0, -1.0), at(0.0, 1.0)], st, 3.0, 2.5));
+            p.line_segment([at(-0.4, -1.0), at(0.4, -1.0)], thin);
+            p.line_segment([at(-0.4, 1.0), at(0.4, 1.0)], thin);
+        }
+        Tool::PolygonLasso => {
+            poly(vec![at(-0.9, -0.2), at(-0.2, -0.9), at(0.9, -0.5), at(0.6, 0.4), at(-0.4, 0.3)], true);
+            poly(vec![at(-0.4, 0.3), at(-0.5, 0.95)], false);
+        }
+        Tool::MagneticLasso => {
+            let pts: Vec<Pos2> = (0..=30).map(|i| { let t = i as f32 / 30.0 * std::f32::consts::TAU; at(t.cos() * 0.9, t.sin() * 0.5 - 0.35) }).collect();
+            poly(pts, false);
+            poly(vec![at(-0.3, 0.3), at(-0.3, 0.9), at(0.3, 0.9), at(0.3, 0.3)], false);
+            p.line_segment([at(-0.3, 0.75), at(0.3, 0.75)], Stroke::new(2.0_f32, Color32::from_rgb(220, 70, 70)));
+        }
+        Tool::QuickSelect => {
+            p.line_segment([at(0.9, -0.9), at(0.0, 0.0)], Stroke::new(2.0_f32, col));
+            p.circle_filled(at(-0.25, 0.25), s * 0.25, col);
+            let pts: Vec<Pos2> = (0..=24).map(|i| { let t = i as f32 / 24.0 * std::f32::consts::TAU; at(-0.3 + t.cos() * 0.6, 0.3 + t.sin() * 0.6) }).collect();
+            p.extend(Shape::dashed_line(&pts, thin, 2.0, 2.0));
+        }
+        Tool::PerspectiveCrop => {
+            poly(vec![at(-0.6, -0.8), at(0.6, -0.5), at(0.8, 0.8), at(-0.8, 0.6)], true);
+            p.line_segment([at(-0.6, -0.8), at(-0.6, -1.0)], st);
+            p.line_segment([at(0.8, 0.8), at(1.0, 0.8)], st);
+        }
+        Tool::Ruler => {
+            poly(vec![at(-1.0, 0.4), at(0.4, -1.0), at(1.0, -0.4), at(-0.4, 1.0)], true);
+            for k in 0..4 {
+                let t = -0.55 + k as f32 * 0.35;
+                p.line_segment([at(t, -t), at(t + 0.18, -t + 0.18)], thin);
+            }
+        }
+        Tool::SpotHealing | Tool::Healing => {
+            poly(vec![at(-0.95, 0.35), at(0.35, -0.95), at(0.95, -0.35), at(-0.35, 0.95)], true);
+            p.rect_stroke(Rect::from_center_size(c, Vec2::splat(s * 0.7)), 0.0, thin);
+            if tool == Tool::SpotHealing {
+                for (dx, dy) in [(-0.1, -0.1), (0.15, 0.1), (-0.05, 0.2)] {
+                    p.circle_filled(at(dx, dy), 1.0, col);
+                }
+            }
+        }
+        Tool::Patch => {
+            p.rect_stroke(Rect::from_min_max(at(-0.9, -0.6), at(0.6, 0.8)), 2.0, st);
+            p.extend(Shape::dashed_line(&[at(-0.6, -0.9), at(0.9, -0.9), at(0.9, 0.5)], thin, 2.0, 2.0));
+        }
+        Tool::RedEye => {
+            let pts: Vec<Pos2> = (0..=24).map(|i| { let t = i as f32 / 24.0 * std::f32::consts::TAU; at(t.cos() * 0.95, t.sin() * 0.5) }).collect();
+            poly(pts, false);
+            p.circle_filled(c, s * 0.3, Color32::from_rgb(220, 60, 60));
+            p.line_segment([at(0.55, -0.95), at(0.55, -0.55)], thin);
+            p.line_segment([at(0.35, -0.75), at(0.75, -0.75)], thin);
+        }
+        Tool::ColorReplace => {
+            p.line_segment([at(0.9, -0.9), at(-0.1, 0.1)], Stroke::new(2.0_f32, col));
+            p.circle_filled(at(-0.4, 0.45), s * 0.3, col);
+            p.circle_stroke(at(0.55, 0.55), s * 0.3, thin);
+        }
+        Tool::Mixer => {
+            p.line_segment([at(0.9, -0.9), at(-0.1, 0.1)], Stroke::new(2.0_f32, col));
+            p.circle_filled(at(-0.4, 0.45), s * 0.32, col);
+            p.circle_filled(at(0.6, 0.6), s * 0.18, Color32::from_rgb(90, 160, 240));
+        }
+        Tool::PatternStamp => {
+            poly(vec![at(-0.9, 0.9), at(0.9, 0.9), at(0.9, 0.5), at(-0.9, 0.5)], true);
+            poly(vec![at(-0.25, 0.5), at(-0.2, -0.2), at(0.2, -0.2), at(0.25, 0.5)], false);
+            p.rect_filled(Rect::from_center_size(at(-0.2, -0.75), Vec2::splat(s * 0.35)), 0.0, col);
+            p.rect_filled(Rect::from_center_size(at(0.2, -0.45), Vec2::splat(s * 0.35)), 0.0, col);
+        }
+        Tool::BackgroundEraser | Tool::MagicEraser => {
+            poly(vec![at(-0.95, 0.4), at(0.2, -0.75), at(0.95, 0.0), at(-0.2, 0.95)], true);
+            if tool == Tool::MagicEraser {
+                for (dx, dy) in [(0.6, -0.8), (0.9, -0.6), (0.4, -0.95)] {
+                    p.circle_filled(at(dx, dy), 1.3, col);
+                }
+            } else {
+                p.extend(Shape::dashed_line(&[at(-0.9, -0.9), at(-0.2, -0.9)], thin, 2.0, 2.0));
+            }
+        }
+        Tool::Blur => {
+            let pts = vec![at(0.0, -1.0), at(0.55, 0.15), at(0.45, 0.6), at(0.0, 0.85), at(-0.45, 0.6), at(-0.55, 0.15)];
+            p.add(Shape::convex_polygon(pts, col, Stroke::NONE));
+        }
+        Tool::Sharpen => poly(vec![at(0.0, -1.0), at(0.7, 0.9), at(-0.7, 0.9)], true),
+        Tool::Smudge => {
+            p.line_segment([at(-0.8, 0.8), at(0.4, -0.4)], Stroke::new(3.5_f32, col));
+            p.circle_filled(at(0.5, -0.5), s * 0.28, col);
+        }
+        Tool::Dodge => {
+            p.line_segment([at(0.0, 0.0), at(0.8, 0.9)], Stroke::new(2.0_f32, col));
+            p.circle_stroke(at(-0.3, -0.35), s * 0.5, st);
+        }
+        Tool::Burn => {
+            poly(vec![at(-0.6, 0.9), at(-0.6, -0.2), at(-0.2, -0.7), at(0.3, -0.7), at(0.6, -0.3), at(0.2, 0.0)], false);
+            p.line_segment([at(0.2, 0.0), at(0.6, 0.9)], st);
+        }
+        Tool::Sponge => {
+            p.rect_stroke(Rect::from_min_max(at(-0.9, -0.6), at(0.9, 0.6)), 4.0, st);
+            for (dx, dy) in [(-0.4, -0.2), (0.3, 0.2), (0.0, -0.3), (-0.2, 0.3), (0.5, -0.2)] {
+                p.circle_filled(at(dx, dy), 1.4, col);
+            }
+        }
+        Tool::Liquify => {
+            for k in 0..3 {
+                let yo = -0.6 + k as f32 * 0.6;
+                let pts: Vec<Pos2> = (0..=16).map(|i| { let t = i as f32 / 16.0; at(-0.9 + 1.8 * t, yo + (t * std::f32::consts::TAU).sin() * 0.2) }).collect();
+                poly(pts, false);
+            }
+        }
+        Tool::Pen | Tool::FreeformPen => {
+            poly(vec![at(0.0, -1.0), at(0.6, 0.1), at(0.25, 0.9), at(-0.25, 0.9), at(-0.6, 0.1)], true);
+            p.line_segment([at(0.0, -0.9), at(0.0, 0.2)], thin);
+            p.circle_filled(at(0.0, 0.25), 1.6, col);
+            if tool == Tool::FreeformPen {
+                let pts: Vec<Pos2> = (0..=10).map(|i| { let t = i as f32 / 10.0; at(-1.0 + t * 0.8, 0.95 - (t * 6.0).sin() * 0.1) }).collect();
+                poly(pts, false);
+            }
+        }
+        Tool::PathSelect | Tool::DirectSelect => {
+            let pts = vec![at(-0.6, -1.0), at(0.6, 0.3), at(0.05, 0.3), at(0.35, 0.95), at(0.1, 1.0), at(-0.2, 0.4), at(-0.6, 0.8)];
+            if tool == Tool::PathSelect {
+                p.add(Shape::convex_polygon(pts.clone(), col, Stroke::NONE));
+            }
+            poly(pts, true);
+        }
+        Tool::VerticalText => {
+            poly(vec![at(-0.6, -0.8), at(-0.85, -0.8), at(-0.85, 0.8), at(-0.6, 0.8)], false);
+            p.line_segment([at(-0.85, 0.0), at(0.85, 0.0)], Stroke::new(2.0_f32, col));
+            p.line_segment([at(0.85, -0.3), at(0.85, 0.3)], st);
+        }
     }
 }

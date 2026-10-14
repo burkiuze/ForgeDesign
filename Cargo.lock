@@ -1310,6 +1310,8 @@ dependencies = [
  "forge-core",
  "forge-io",
  "rfd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

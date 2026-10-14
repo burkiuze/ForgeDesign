@@ -50,7 +50,7 @@ pub const OPEN_EXTENSIONS: &[&str] = &[
 ];
 
 /// Extensions accepted by [`export`].
-pub const EXPORT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "gif", "ico", "qoi", "pdf", "psd"];
+pub const EXPORT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "tga", "gif", "ico", "qoi", "pdf", "psd", "svg"];
 
 #[derive(Clone, Copy, Debug)]
 pub struct ExportOptions {
@@ -135,6 +135,7 @@ pub fn save(state: &DocState, path: &Path) -> Result<()> {
 pub fn export(state: &DocState, path: &Path, opts: ExportOptions) -> Result<()> {
     let bytes = match extension(path).as_str() {
         "pdf" => export_pdf(state, 300.0, opts)?,
+        "svg" => export_svg(state)?,
         "psd" => write_psd(state)?,
         "ora" => write_ora(state)?,
         ext => export_bytes(state, ext, opts)?,
@@ -181,6 +182,55 @@ pub fn export_pdf(state: &DocState, dpi: f32, opts: ExportOptions) -> Result<Vec
     }
     out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", offsets.len() + 1).as_bytes());
     Ok(out)
+}
+
+/// SVG export: the flattened image embedded as PNG plus every vector path
+/// as a real `<path>` (useful for handing artwork to vector tools / the web).
+pub fn export_svg(state: &DocState) -> Result<Vec<u8>> {
+    let (w, h) = (state.width, state.height);
+    let png = export_bytes(state, "png", ExportOptions::default())?;
+    let mut svg = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">\n"
+    );
+    svg.push_str(&format!("  <image width=\"{w}\" height=\"{h}\" xlink:href=\"data:image/png;base64,{}\"/>\n", base64(&png)));
+    for p in &state.paths {
+        let mut d = String::new();
+        for sp in &p.subpaths {
+            let n = sp.anchors.len();
+            if n == 0 {
+                continue;
+            }
+            d.push_str(&format!("M{:.2} {:.2} ", sp.anchors[0].p.x, sp.anchors[0].p.y));
+            let count = if sp.closed { n } else { n - 1 };
+            for i in 0..count {
+                let (a, b) = (sp.anchors[i], sp.anchors[(i + 1) % n]);
+                d.push_str(&format!(
+                    "C{:.2} {:.2} {:.2} {:.2} {:.2} {:.2} ",
+                    a.h_out.x, a.h_out.y, b.h_in.x, b.h_in.y, b.p.x, b.p.y
+                ));
+            }
+            if sp.closed {
+                d.push('Z');
+            }
+        }
+        let name: String = p.name.chars().filter(|c| c.is_alphanumeric() || *c == ' ').collect();
+        svg.push_str(&format!("  <path id=\"{name}\" d=\"{}\" fill=\"none\" stroke=\"#000\" stroke-width=\"1\"/>\n", d.trim()));
+    }
+    svg.push_str("</svg>\n");
+    Ok(svg.into_bytes())
+}
+
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
 }
 
 /// Frame animation: each visible pixel layer (bottom first) becomes one
@@ -332,13 +382,19 @@ mod tests {
             ..Default::default()
         });
         d.group_layer();
+        let mut adj = forge_core::Layer::new_adjustment(99, forge_core::adjust::Adjustment::Invert, 30, 30);
+        adj.id = d.state.alloc_id();
+        d.state.layers.insert(0, adj);
         let s = read_ora(&write_ora(&d.state).unwrap()).unwrap();
+        assert!(s.layers[0].is_adjustment());
+        assert_eq!(s.layers[0].adjustment, Some(forge_core::adjust::Adjustment::Invert));
+        let s = DocState { layers: s.layers[1..].to_vec(), ..s };
         assert_eq!(s.layers.len(), 3);
         assert!(s.layers[2].is_group());
         assert_eq!(s.layers[1].parent, Some(s.layers[2].id));
         assert!(s.layers[1].clipped);
         assert!((s.layers[1].fill - 0.25).abs() < 1e-3);
-        assert_eq!(s.layers[1].style, d.state.layers[1].style);
+        assert_eq!(s.layers[1].style, d.state.layers[2].style);
     }
 
     #[test]
@@ -349,6 +405,10 @@ mod tests {
         assert!(pdf.starts_with(b"%PDF") && pdf.ends_with(b"%%EOF\n"));
         let gif = export_gif_animation(&d.state, 100, false).unwrap();
         assert!(gif.starts_with(b"GIF89a"));
+        assert_eq!(base64(b"Man"), "TWFu");
+        assert_eq!(base64(b"Ma"), "TWE=");
+        let svg = String::from_utf8(export_svg(&d.state).unwrap()).unwrap();
+        assert!(svg.contains("<svg") && svg.contains("data:image/png;base64,"));
     }
 
     #[test]
